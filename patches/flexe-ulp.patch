@@ -1,0 +1,45 @@
+--- a/src/peripherals.h
++++ b/src/peripherals.h
+@@ -548,6 +548,9 @@
+  * firmware's gpio_get_level() returns the new value on its next read. */
+ void periph_gpio_set_input(esp32_periph_t *p, int pin, int level);
+ 
++/* Classic ULP WAKE uses normal RTC masking and clear semantics. */
++void periph_ulp_wake(esp32_periph_t *p);
++
+ /* Capacitive touch: set the raw count a pad reports. The ESP32 counts *down*
+  * as capacitance rises, so a touched pad reads below its threshold. Pads are
+  * 0-9, mapping to GPIO 4, 0, 2, 15, 13, 12, 14, 27, 33, 32. */
+--- a/src/peripherals.c
++++ b/src/peripherals.c
+@@ -3633,6 +3633,11 @@
+         periph_deassert_interrupt(p, RTC_CORE_INTR_SOURCE);
+ }
+ 
++void periph_ulp_wake(esp32_periph_t *p) {
++    p->rtc_int_raw |= 1u << 5;
++    rtc_irq_update(p);
++}
++
+ static void touch_raise_int(esp32_periph_t *p) {
+     p->rtc_int_raw |= RTC_CNTL_TOUCH_INT_BIT;
+     rtc_irq_update(p);
+--- a/src/flexe_session.c
++++ b/src/flexe_session.c
+@@ -1076,7 +1076,15 @@
+     /* Dual-core: run core 1 batch (or poll scheduler if parked) */
+     if (!s->single_core && s->cpu[1].pc != 0) {
+         if (app_cpu_released && s->cpu[1].running) {
+-            core1_ran = flexe_session_run_core(s, 1, batch_size);
++            /* Native frontends may service a higher-priority APP IRQ first.
++             * Charge that work to this batch rather than advancing APP twice. */
++            int budget = batch_size;
++            if (s->native_freertos && s->cpu[1].cycle_count >= s->cpu[0].cycle_count)
++                budget = 0;
++            else if (s->native_freertos &&
++                     s->cpu[0].cycle_count - s->cpu[1].cycle_count < (uint64_t)budget)
++                budget = (int)(s->cpu[0].cycle_count - s->cpu[1].cycle_count);
++            core1_ran = flexe_session_run_core(s, 1, budget);
+             if (s->frt && !s->native_freertos)
+                 freertos_stubs_check_preempt_core(s->frt, 1);
+         } else if (app_cpu_released && s->frt && !s->native_freertos) {

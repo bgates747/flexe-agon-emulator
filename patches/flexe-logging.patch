@@ -1,0 +1,108 @@
+--- /dev/null
++++ b/src/flexe_log.h
+@@ -0,0 +1,9 @@
++/* Owned integration logging control. Copyright 2026 Brandon Gates; MIT.
++ * Routine core diagnostics only; errors and opt-in trace controls remain intact.
++ */
++#ifndef FLEXE_LOG_H
++#define FLEXE_LOG_H
++#include <stdbool.h>
++void flexe_set_debug_logging(bool enabled);
++bool flexe_debug_logging_enabled(void);
++#endif
+--- a/src/flexe_session.c
++++ b/src/flexe_session.c
+@@ -7,6 +7,8 @@
+ 
+ #include "msvc_compat.h"
+ #include "flexe_session.h"
++#include "flexe_log.h"
++#include <stdatomic.h>
+ #include "target.h"
+ #include "memory.h"
+ #include "loader.h"
+@@ -33,6 +35,16 @@
+ #include <string.h>
+ #include <stdbool.h>
+ #include <time.h>
++
++/* Preserve upstream verbosity for standalone users; the adapter explicitly
++ * selects normal or verbose output before starting the emulation threads. */
++static atomic_bool flexe_debug_logging = true;
++void flexe_set_debug_logging(bool enabled) {
++    atomic_store_explicit(&flexe_debug_logging, enabled, memory_order_relaxed);
++}
++bool flexe_debug_logging_enabled(void) {
++    return atomic_load_explicit(&flexe_debug_logging, memory_order_relaxed);
++}
+ 
+ /* rtc.h: timer wake trigger, and the RESET_REASON for a deep-sleep wake. */
+ #define RTC_TIMER_WAKE_CAUSE        (1u << 3)
+@@ -215,13 +227,15 @@
+     const bool classic_compat =
+         (target->capabilities &
+          FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS) != 0u;
+-    fprintf(stderr, "Loaded %s image %s: %d segments, entry=0x%08X\n",
+-            target ? target->display_name : "unknown", cfg->bin_path,
+-            res.segment_count, res.entry_point);
+-    for (int i = 0; i < res.segment_count; i++) {
+-        fprintf(stderr, "  Segment %d: 0x%08X (%u bytes) -> %s\n",
+-                i, res.segments[i].addr, res.segments[i].size,
+-                loader_region_name_for_target(target, res.segments[i].addr));
++    if (flexe_debug_logging_enabled()) {
++        fprintf(stderr, "Loaded %s image %s: %d segments, entry=0x%08X\n",
++                target ? target->display_name : "unknown", cfg->bin_path,
++                res.segment_count, res.entry_point);
++        for (int i = 0; i < res.segment_count; i++) {
++            fprintf(stderr, "  Segment %d: 0x%08X (%u bytes) -> %s\n",
++                    i, res.segments[i].addr, res.segments[i].size,
++                    loader_region_name_for_target(target, res.segments[i].addr));
++        }
+     }
+     if ((target->capabilities & FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF) &&
+         mem_prepare_rom_flash(s->mem, rom_flash_data_addr,
+@@ -1069,7 +1083,7 @@
+         s->cpu[1].pc = app_cpu_boot_addr;
+         s->cpu[1].running = true;
+         s->app_cpu_started = true;
+-        fprintf(stderr, "[%10llu] CORE1 started at 0x%08X\n",
++        if (flexe_debug_logging_enabled()) fprintf(stderr, "[%10llu] CORE1 started at 0x%08X\n",
+                 (unsigned long long)s->cpu[0].cycle_count, s->cpu[1].pc);
+     }
+ 
+--- a/src/rom_stubs.c
++++ b/src/rom_stubs.c
+@@ -1,4 +1,5 @@
+ #include "rom_stubs.h"
++#include "flexe_log.h"
+ #include "target.h"
+ #include "elf_symbols.h"
+ #include "memory.h"
+@@ -466,7 +467,7 @@
+ static void stub_ets_set_appcpu_boot_addr(xtensa_cpu_t *cpu, void *ctx) {
+     esp32_rom_stubs_t *s = ctx;
+     uint32_t addr = rom_arg(cpu, 0);
+-    fprintf(stderr, "[APPCPU] boot addr = 0x%08X (from pc=0x%08X)\n", addr, cpu->pc);
++    if (flexe_debug_logging_enabled()) fprintf(stderr, "[APPCPU] boot addr = 0x%08X (from pc=0x%08X)\n", addr, cpu->pc);
+     s->app_cpu_boot_addr = addr;
+ 
+     /* Always set s_cpu_up[1] = 1 (tells core 0 that core 1 is alive) */
+--- a/src/xtensa.c
++++ b/src/xtensa.c
+@@ -7,6 +7,7 @@
+ #include "guest_call.h"
+ #include "memory.h"
+ #include "rom_stubs.h"
++#include "flexe_log.h"
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
+@@ -321,7 +322,7 @@
+             count++;
+         }
+     }
+-    fprintf(stderr, "[predecode] Built table: %u entries, %u MB (%u MB flash coverage)\n",
++    if (flexe_debug_logging_enabled()) fprintf(stderr, "[predecode] Built table: %u entries, %u MB (%u MB flash coverage)\n",
+             count, (uint32_t)(PREDECODE_SIZE * 4 / (1024*1024)), PREDECODE_FLASH_MB);
+ #endif
+ }

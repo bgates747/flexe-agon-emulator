@@ -1,0 +1,939 @@
+use crate::parse_args::parse_args;
+use agon_ez80_emulator::debugger::{DebugCmd, DebugResp, DebuggerConnection, PauseReason, Trigger};
+use agon_ez80_emulator::{gpio, AgonMachine, AgonMachineConfig, GpioVgaFrame, RamInit, SerialLink};
+use sdl3;
+use sdl3::audio::AudioStreamOwner;
+use sdl3::event::Event;
+use sdl3_sys::everything::{SDL_ScaleMode, SDL_SetTextureScaleMode};
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
+mod ascii2vk;
+mod audio;
+mod ez80_serial_links;
+mod joypad;
+mod parse_args;
+mod sdl2ps2;
+mod vdp_interface;
+
+const PREFIX: Option<&'static str> = option_env!("PREFIX");
+
+static HOST_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+extern "C" fn request_host_shutdown(_: i32) {
+    HOST_SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(unix)]
+extern "C" {
+    fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+#[derive(PartialEq)]
+enum VideoSource {
+    Auto,
+    Vdp,
+    //Ez80Gpio,
+}
+
+/**
+ * Return firmware paths in priority order.
+ */
+pub fn firmware_paths(
+    ver: parse_args::FirmwareVer,
+    explicit_path: Option<std::path::PathBuf>,
+    is_mos: bool,
+) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = vec![];
+
+    if let Some(ref p) = explicit_path {
+        paths.push(p.clone());
+    }
+
+    let base_path = match PREFIX {
+        None => std::path::Path::new(".").join("firmware"),
+        Some(prefix) => std::path::Path::new(prefix)
+            .join("share")
+            .join("flexe-agon-emulator"),
+    };
+
+    if !is_mos {
+        return vec![explicit_path.unwrap_or_else(|| base_path.join("flexe-vdp.so"))];
+    }
+
+    for v in [ver, parse_args::FirmwareVer::console8] {
+        paths.push(base_path.join(format!(
+            "{}_{:?}.{}",
+            if is_mos { "mos" } else { "vdp" },
+            v,
+            if is_mos { "bin" } else { "so" }
+        )));
+    }
+
+    paths
+}
+
+pub fn main() -> () {
+    std::process::exit(main_loop());
+}
+
+pub fn main_loop() -> i32 {
+    #[cfg(unix)] unsafe {
+        signal(2, request_host_shutdown);
+        signal(15, request_host_shutdown);
+    }
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Error parsing arguments: {}", e);
+            std::process::exit(-1);
+        }
+    };
+    let vdp_interface = vdp_interface::init(
+        firmware_paths(args.firmware, args.vdp_dll, false),
+        args.verbose,
+    );
+
+    unsafe { (*vdp_interface.setVdpDebugLogging)(args.verbose) }
+
+    let (tx_cmd_debugger, rx_cmd_debugger): (Sender<DebugCmd>, Receiver<DebugCmd>) =
+        mpsc::channel();
+    let (tx_resp_debugger, rx_resp_debugger): (Sender<DebugResp>, Receiver<DebugResp>) =
+        mpsc::channel();
+
+    let (tx_gpio_vga_frame, rx_gpio_vga_frame) = mpsc::channel::<GpioVgaFrame>();
+
+    let gpios = Arc::new(gpio::GpioSet::new());
+
+    // Atomics for various state communication
+    let ez80_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let emulator_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let soft_reset = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exit_status = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+
+    for breakpoint in &args.breakpoints {
+        let trigger = Trigger {
+            address: *breakpoint,
+            once: false,
+            actions: vec![
+                DebugCmd::Pause(PauseReason::DebuggerBreakpoint),
+                DebugCmd::GetState,
+            ],
+        };
+        let debug_cmd = DebugCmd::AddTrigger(trigger);
+        _ = tx_cmd_debugger.send(debug_cmd);
+    }
+
+    // Preserve stdin state, as debugger can leave stdin in raw mode
+    #[cfg(target_os = "linux")]
+    let _tty = raw_tty::TtyWithGuard::new(std::io::stdin());
+
+    // Prefer wayland on linux
+    /*
+    #[cfg(target_os = "linux")]
+    if sdl3::video::drivers().any(|drv| drv == "wayland") {
+        sdl3::hint::set(sdl3::hint::names::VIDEO_DRIVER, "wayland");
+    }
+    */
+
+    let debugger_con = if args.debugger {
+        let _ez80_paused = ez80_paused.clone();
+        let _emulator_shutdown = emulator_shutdown.clone();
+        let _debugger_thread = thread::spawn(move || {
+            agon_light_emulator_debugger::start(
+                tx_cmd_debugger,
+                rx_resp_debugger,
+                _emulator_shutdown,
+                _ez80_paused.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        });
+        Some(DebuggerConnection {
+            tx: tx_resp_debugger,
+            rx: rx_cmd_debugger,
+        })
+    } else {
+        None
+    };
+
+    let sdcard_img_file =
+        args.sdcard_img.as_ref().and_then(|filename| {
+            match std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(filename)
+            {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    eprintln!("Could not open sdcard image '{}': {:?}", filename, e);
+                    std::process::exit(-1);
+                }
+            }
+        });
+
+    let _cpu_thread = {
+        let _exit_status = exit_status.clone();
+        let _ez80_paused = ez80_paused.clone();
+        let _emulator_shutdown = emulator_shutdown.clone();
+        let soft_reset_ez80 = soft_reset.clone();
+        let gpios_ = gpios.clone();
+
+        thread::Builder::new()
+            .name("ez80".to_string())
+            .spawn(move || {
+                let ez80_firmware = firmware_paths(args.firmware, args.mos_bin, true).remove(0);
+
+                let sdcard_dir = if let Some(p) = args.sdcard {
+                    std::path::PathBuf::from(p)
+                } else if let Some(home_dir) = home::home_dir() {
+                    let p = home_dir.join(".agon-sdcard");
+                    if p.exists() {
+                        p
+                    } else {
+                        std::path::PathBuf::from("sdcard".to_string())
+                    }
+                } else {
+                    std::path::PathBuf::from("sdcard".to_string())
+                };
+
+                if args.verbose {
+                    eprintln!("EZ80 firmware: {:?}", ez80_firmware);
+                    eprintln!("Emulated SDCard: {:?}", sdcard_dir);
+                }
+
+                if args.ram_size != 512 {
+                    println!("Non-standard RAM size: {}KiB", args.ram_size);
+                }
+
+                let uart1_serial: Option<Box<dyn SerialLink>> =
+                    args.uart1_device.as_ref().and_then(|device| {
+                        let baud = args.uart1_baud.unwrap_or(9600);
+                        println!("Using uart1 device {:?}, baud rate {:?}", device, baud);
+                        match ez80_serial_links::Ez80ToHostSerialLink::try_open(&device, baud) {
+                            Some(link) => Some(Box::new(link) as Box<dyn SerialLink>),
+                            None => None,
+                        }
+                    });
+                let uart1_dummy: Box<dyn SerialLink> =
+                    Box::new(ez80_serial_links::DummySerialLink {
+                        name: "uart1".to_string(),
+                    });
+
+                // Prepare the device
+                let mut machine = AgonMachine::new(AgonMachineConfig {
+                    ram_init: if args.zero {
+                        RamInit::Zero
+                    } else {
+                        RamInit::Random
+                    },
+                    uart0_link: Box::new(ez80_serial_links::Ez80ToVdpSerialLink {
+                        z80_uart0_is_cts: vdp_interface.z80_uart0_is_cts.clone(),
+                        z80_send_to_vdp: vdp_interface.z80_send_to_vdp.clone(),
+                        z80_recv_from_vdp: vdp_interface.z80_recv_from_vdp.clone(),
+                    }),
+                    uart1_link: uart1_serial.unwrap_or(uart1_dummy),
+                    gpios: gpios_,
+                    soft_reset: soft_reset_ez80,
+                    emulator_shutdown: _emulator_shutdown,
+                    exit_status: _exit_status,
+                    paused: _ez80_paused,
+                    tx_gpio_vga_frame,
+                    clockspeed_hz: if args.unlimited_cpu {
+                        1000_000_000
+                    } else {
+                        18_432_000
+                    },
+                    mos_bin: ez80_firmware,
+                    interrupt_precision: if args.precise_interrupts { 1 } else { 16 },
+                    external_ram_size: args.ram_size * 1024,
+                });
+                machine.set_sdcard_directory(sdcard_dir);
+                machine.set_sdcard_image(sdcard_img_file);
+                machine.start(debugger_con);
+                panic!("ez80 cpu thread terminated");
+            })
+    };
+
+    let sdl_context = sdl3::init().unwrap();
+    let video_subsystem = sdl_context.video().unwrap();
+    let scaled_native_resolution = video_subsystem
+        .get_primary_display()
+        .unwrap()
+        .get_bounds()
+        .unwrap();
+    let video_subsystem = sdl_context.video().unwrap();
+    let joystick_subsystem = sdl_context.joystick().unwrap();
+    let mut event_pump = sdl_context.event_pump().unwrap();
+    let mut joysticks = vec![];
+    let mut got_gpio_vga_sync: u32 = 0;
+    let mut video_src = VideoSource::Auto;
+
+    if args.verbose { println!(
+        "Video driver: {} (can override with SDL_VIDEO_DRIVER environment variable)",
+        video_subsystem.current_video_driver()
+    ); }
+
+    open_joystick_devices(&mut joysticks, &joystick_subsystem);
+
+    struct AudioStreamSet {
+        vdp: sdl3::audio::AudioStreamWithCallback<audio::VdpAudioStream>,
+        gpio: sdl3::audio::AudioStreamOwner,
+    }
+
+    let audio_streams = (|| -> Result<AudioStreamSet, sdl3::Error> {
+        let audio_subsystem = sdl_context.audio()?;
+        let device = audio_subsystem.open_playback_device(&sdl3::audio::AudioSpec {
+            format: Some(sdl3::audio::AudioFormat::U8),
+            freq: Some(48000),
+            channels: Some(1),
+        })?;
+
+        let vdp_audiostream = audio_subsystem.open_playback_stream_with_callback(
+            &device,
+            &sdl3::audio::AudioSpec {
+                format: Some(sdl3::audio::AudioFormat::U8),
+                freq: Some(16384), // real VDP uses 16384Hz
+                channels: Some(1),
+            },
+            audio::VdpAudioStream {
+                buffer: vec![],
+                getAudioSamples: vdp_interface.getAudioSamples,
+            },
+        )?;
+
+        vdp_audiostream.resume()?;
+
+        let gpio_audiostream = device.open_device_stream(Some(&sdl3::audio::AudioSpec {
+            format: Some(sdl3::audio::AudioFormat::U8),
+            freq: Some(48000),
+            channels: Some(1),
+        }))?;
+
+        Ok(AudioStreamSet {
+            vdp: vdp_audiostream,
+            gpio: gpio_audiostream,
+        })
+    })()
+    .inspect_err(|e| {
+        eprintln!("Error opening audio stream: {}", e);
+    })
+    .ok();
+
+    // VDP thread
+    let hybrid_backend = vdp_interface.flexe_vdp_frames.is_some();
+    let mut last_native_frame = 0u64;
+    let vdp_thread = thread::Builder::new()
+        .name("VDP".to_string())
+        .spawn(move || unsafe {
+            if let Some(scr_mode) = args.scr_mode {
+                (*vdp_interface.set_startup_screen_mode)(scr_mode);
+            }
+            (*vdp_interface.vdp_setup)();
+            (*vdp_interface.vdp_loop)();
+        });
+
+    let mut screen_scale = args.screen_scale;
+    let mut is_fullscreen = args.fullscreen;
+    // large enough for any agon video mode
+    let mut vgabuf: Vec<u8> = Vec::with_capacity(1024 * 768 * 3);
+    unsafe {
+        vgabuf.set_len(1024 * 768 * 3);
+    }
+    let mut gpio_frame: Option<GpioVgaFrame> = None;
+    let mut frame_rate_hz: f32 = 60.0;
+    let mut mode_w: u32 = 640;
+    let mut mode_h: u32 = 480;
+    let mut mouse_btn_state: u8 = 0;
+    let mut held_keys = std::collections::BTreeSet::new();
+
+    joypad::clear_state(&gpios);
+
+    'running: loop {
+        let (wx, wy): (u32, u32) = {
+            let nat = (
+                scaled_native_resolution.w as u32,
+                scaled_native_resolution.h as u32,
+            );
+            if is_fullscreen {
+                nat
+            } else if nat.1 - 64 >= mode_h {
+                // pick an integer scale that fits screen height (minus 64, to give titlebar space)
+                calc_int_scale((nat.0, nat.1 - 64), (mode_w, mode_h))
+            } else {
+                // fall back to a window at least as large as the agon startup resolution (640x480)
+                (mode_w, mode_h)
+            }
+        };
+        //println!("Scaled window size wx,wy: {}, {}", wx, wy);
+
+        let mut window = video_subsystem
+            .window(
+                &format!("{} {}", "Flexe Agon Emulator", env!("CARGO_PKG_VERSION")),
+                wx,
+                wy,
+            )
+            .high_pixel_density()
+            .resizable()
+            .position_centered()
+            .build()
+            .unwrap();
+
+        /*println!(
+            "Window size in pixels: {:?}, scale {:?}",
+            window.size_in_pixels(),
+            window.display_scale()
+        );*/
+
+        if args.osk {
+            video_subsystem.text_input().start(&window);
+        }
+
+        sdl_context
+            .mouse()
+            .set_relative_mouse_mode(&window, is_fullscreen);
+
+        window.set_fullscreen(is_fullscreen).unwrap();
+        window.set_mouse_grab(is_fullscreen);
+        sdl_context.mouse().show_cursor(!is_fullscreen);
+
+        let mut canvas = {
+            match args.renderer {
+                parse_args::Renderer::Software => sdl3::render::create_renderer(
+                    window,
+                    Some(core::ffi::CStr::from_bytes_with_nul(b"software\0").unwrap()),
+                )
+                .unwrap(),
+                parse_args::Renderer::Accelerated => window.into_canvas(),
+            }
+        };
+
+        let output_size = canvas.output_size().unwrap();
+        //println!("output_size: {:?}", output_size);
+        let texture_creator = canvas.texture_creator();
+        let (mut agon_texture, mut upscale_texture) =
+            make_agon_screen_textures(&texture_creator, output_size, (mode_w, mode_h));
+
+        // clear the screen, so user isn't staring at garbage while things init
+        canvas.present();
+
+        let mut last_frame_time = std::time::Instant::now();
+
+        'inner: loop {
+            let frame_duration = std::time::Duration::from_micros(1_000_000 / frame_rate_hz as u64);
+            let elapsed_since_last_frame = last_frame_time.elapsed();
+            if elapsed_since_last_frame < frame_duration {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            } else if elapsed_since_last_frame > std::time::Duration::from_millis(100) {
+                // don't let lots of frames queue up, due to system lag or whatever
+                last_frame_time = std::time::Instant::now();
+            }
+
+            // Present a frame
+            last_frame_time = last_frame_time
+                .checked_add(frame_duration)
+                .unwrap_or(std::time::Instant::now());
+
+            // Hybrid ESP32 backends own physical scanout timing. Presenting
+            // an unchanged frame must not generate another eZ80 VSync.
+            let native_frame_changed = if let Some(ref frames) = vdp_interface.flexe_vdp_frames {
+                let now = unsafe { (**frames)() };
+                let changed = now != last_native_frame;
+                last_native_frame = now;
+                changed
+            } else { true };
+            // signal vsync to ez80 via GPIO (pin 1 (from 0) of GPIO port B)
+            if native_frame_changed {
+                // XXX note this is wrong, should be asserted for the whole vblank duration.
+                // but we do it here just for an instant since that's sufficient to trigger
+                // the interrupt.
+                gpios.b.set_input_pin(1, true);
+                gpios.b.set_input_pin(1, false);
+            }
+            // signal vblank to VDP
+            unsafe {
+                (*vdp_interface.signal_vblank)();
+            }
+
+            // shutdown if requested (atomic could be set from the debugger)
+            if HOST_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
+                || emulator_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                break 'running;
+            }
+
+            if let Some(ref failed) = vdp_interface.flexe_vdp_failed {
+                if unsafe { (**failed)() } {
+                    exit_status.store(2, std::sync::atomic::Ordering::Relaxed);
+                    break 'running;
+                }
+            }
+            for event in event_pump.poll_iter() {
+                match event {
+                    Event::Quit { .. } => break 'running,
+                    Event::TextInput { ref text, .. } if args.osk => {
+                        for b in text.chars() {
+                            let vk = ascii2vk::ascii2vk(b);
+                            if vk > 0 {
+                                unsafe {
+                                    (*vdp_interface.sendVKeyEventToFabgl)(vk, 1);
+                                    (*vdp_interface.sendVKeyEventToFabgl)(vk, 0);
+                                }
+                            }
+                        }
+                    }
+                    Event::KeyDown {
+                        keycode,
+                        scancode,
+                        keymod,
+                        repeat,
+                        ..
+                    } => {
+                        // The modeled keyboard owns typematic, including VDP
+                        // delay/rate commands. Ignore host desktop repeat.
+                        if repeat { continue; }
+                        let hostkey = if args.alternative_hostkey {
+                            sdl3::keyboard::Mod::RALTMOD | sdl3::keyboard::Mod::MODEMOD
+                        } else {
+                            sdl3::keyboard::Mod::RCTRLMOD
+                        };
+                        // handle emulator shortcut keys
+                        let consumed = if keymod.intersects(hostkey) {
+                            match keycode {
+                                Some(sdl3::keyboard::Keycode::_1) => {
+                                    video_src = VideoSource::Vdp;
+                                    true
+                                }
+                                Some(sdl3::keyboard::Keycode::_2) => {
+                                    video_src = VideoSource::Auto;
+                                    true
+                                }
+                                Some(sdl3::keyboard::Keycode::C) => {
+                                    // caps-lock
+                                    unsafe {
+                                        (*vdp_interface.sendPS2KbEventToFabgl)(0x58, 1);
+                                        (*vdp_interface.sendPS2KbEventToFabgl)(0x58, 0);
+                                    }
+                                    true
+                                }
+                                Some(sdl3::keyboard::Keycode::F) => {
+                                    for code in std::mem::take(&mut held_keys) {
+                                        unsafe { (*vdp_interface.sendPS2KbEventToFabgl)(code, 0); }
+                                    }
+                                    is_fullscreen = !is_fullscreen;
+                                    break 'inner;
+                                }
+                                Some(sdl3::keyboard::Keycode::M) => {
+                                    unsafe {
+                                        (*vdp_interface.dump_vdp_mem_stats)();
+                                    }
+                                    true
+                                }
+                                Some(sdl3::keyboard::Keycode::Q) => {
+                                    break 'running;
+                                }
+                                Some(sdl3::keyboard::Keycode::R) => {
+                                    soft_reset.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    true
+                                }
+                                Some(sdl3::keyboard::Keycode::S) => {
+                                    screen_scale = match screen_scale {
+                                        parse_args::ScreenScale::StretchAny => {
+                                            parse_args::ScreenScale::Scale4_3
+                                        }
+                                        parse_args::ScreenScale::Scale4_3 => {
+                                            parse_args::ScreenScale::ScaleInteger
+                                        }
+                                        parse_args::ScreenScale::ScaleInteger => {
+                                            parse_args::ScreenScale::StretchAny
+                                        }
+                                    };
+                                    true
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
+                        if let Some(scancode) = scancode.filter(|_| !consumed) {
+                            let ps2scancode =
+                                sdl2ps2::sdl2ps2(scancode, args.swap_caps_and_ctrl);
+                            if ps2scancode > 0 {
+                                if (sdl2ps2::is_not_ascii(scancode) || !args.osk)
+                                    && held_keys.insert(ps2scancode) {
+                                    unsafe {
+                                        (*vdp_interface.sendPS2KbEventToFabgl)(ps2scancode, 1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Event::KeyUp { scancode, .. } => {
+                        let Some(scancode) = scancode else { continue; };
+                        let ps2scancode =
+                            sdl2ps2::sdl2ps2(scancode, args.swap_caps_and_ctrl);
+                        if held_keys.remove(&ps2scancode) {
+                            unsafe {
+                                (*vdp_interface.sendPS2KbEventToFabgl)(ps2scancode, 0);
+                            }
+                        }
+                    }
+                    Event::Window { win_event: sdl3::event::WindowEvent::FocusLost, .. } => {
+                        for code in std::mem::take(&mut held_keys) {
+                            unsafe { (*vdp_interface.sendPS2KbEventToFabgl)(code, 0); }
+                        }
+                    }
+                    Event::MouseButtonUp { mouse_btn, .. } => {
+                        mouse_btn_state &= match mouse_btn {
+                            sdl3::mouse::MouseButton::Left => !1,
+                            sdl3::mouse::MouseButton::Right => !2,
+                            sdl3::mouse::MouseButton::Middle => !4,
+                            _ => !0,
+                        };
+                        let packet: [u8; 4] = [8 | mouse_btn_state, 0, 0, 0];
+                        unsafe {
+                            (*vdp_interface.sendHostMouseEventToFabgl)(&packet[0] as *const u8);
+                        }
+                    }
+                    Event::MouseButtonDown { mouse_btn, .. } => {
+                        mouse_btn_state |= match mouse_btn {
+                            sdl3::mouse::MouseButton::Left => 1,
+                            sdl3::mouse::MouseButton::Right => 2,
+                            sdl3::mouse::MouseButton::Middle => 4,
+                            _ => 0,
+                        };
+                        let packet: [u8; 4] = [8 | mouse_btn_state, 0, 0, 0];
+                        unsafe {
+                            (*vdp_interface.sendHostMouseEventToFabgl)(&packet[0] as *const u8);
+                        }
+                    }
+                    Event::MouseWheel { y, .. } => {
+                        let mut packet: [u8; 4] = [8 | mouse_btn_state, 0, 0, 0];
+                        packet[3] = if y > 0.0 {
+                            1
+                        } else if y < 0.0 {
+                            255
+                        } else {
+                            0
+                        };
+                        unsafe {
+                            (*vdp_interface.sendHostMouseEventToFabgl)(&packet[0] as *const u8);
+                        }
+                    }
+                    Event::MouseMotion { xrel, yrel, .. } => {
+                        let x = (xrel * args.mouse_accel).clamp(-256.0, 255.0) as i32;
+                        let y = (-yrel * args.mouse_accel).clamp(-256.0, 255.0) as i32;
+                        let mut packet: [u8; 4] = [8 | mouse_btn_state, 0, 0, 0];
+                        // packet[1],[2]: int9_t, with sign bits in packet[0] ;-)
+                        packet[1] = x as u8;
+                        packet[2] = y as u8;
+                        packet[0] |= if x < 0 { 0x10 } else { 0 };
+                        packet[0] |= if y < 0 { 0x20 } else { 0 };
+
+                        unsafe {
+                            (*vdp_interface.sendHostMouseEventToFabgl)(&packet[0] as *const u8);
+                        }
+                    }
+                    Event::JoyHatMotion {
+                        which,
+                        hat_idx,
+                        state,
+                        ..
+                    } => {
+                        joypad::on_hat_motion(&gpios, which, hat_idx, state);
+                    }
+                    Event::JoyButtonUp {
+                        which, button_idx, ..
+                    } => {
+                        joypad::on_button(&gpios, which, button_idx, false);
+                    }
+                    Event::JoyButtonDown {
+                        which, button_idx, ..
+                    } => {
+                        joypad::on_button(&gpios, which, button_idx, true);
+                    }
+                    Event::JoyAxisMotion {
+                        which,
+                        axis_idx,
+                        value,
+                        ..
+                    } => {
+                        joypad::on_axis_motion(&gpios, which, axis_idx, value);
+                    }
+                    Event::JoyDeviceRemoved { .. } => {}
+                    Event::JoyDeviceAdded { .. } => {
+                        open_joystick_devices(&mut joysticks, &joystick_subsystem);
+                    }
+                    _ => {}
+                }
+            }
+
+            {
+                let mut w: u32 = 0;
+                let mut h: u32 = 0;
+
+                // If there is an eZ80 GPIO VGA frame, show that
+                if let Ok(img) = rx_gpio_vga_frame.try_recv() {
+                    fn put_gpio_audiodata(streams: &Option<AudioStreamSet>, img: &GpioVgaFrame) {
+                        // If less than 50ms of audio data enqueued, put more in
+                        if let Some(ref streams) = streams {
+                            if streams.gpio.queued_bytes().unwrap() < 2400 {
+                                let _ = streams.gpio.put_data(img.audio.as_slice());
+                                let _ = streams.gpio.resume();
+                            }
+                        }
+                    }
+                    put_gpio_audiodata(&audio_streams, &img);
+
+                    w = img.width;
+                    h = img.height;
+
+                    for _y in 0..h {
+                        for _x in 0..w {
+                            let __y = _y + img.scanline_img_start;
+                            let pixel = img.picture[img.line_length_cycles as usize * __y as usize
+                                + (_x as u64) as usize];
+                            vgabuf[(w * 3 * _y + 3 * _x + 0) as usize] = (pixel >> 5) * 36;
+                            vgabuf[(w * 3 * _y + 3 * _x + 1) as usize] = ((pixel >> 2) & 7) * 36;
+                            vgabuf[(w * 3 * _y + 3 * _x + 2) as usize] = (pixel & 0x3) * 85;
+                        }
+                    }
+
+                    got_gpio_vga_sync = 4;
+
+                    // drop further queued frames to avoid backlog
+                    while let Ok(_img) = rx_gpio_vga_frame.try_recv() {
+                        put_gpio_audiodata(&audio_streams, &_img);
+                    }
+
+                    gpio_frame = Some(img);
+                }
+
+                // scan out gpio_frame for a couple of frames till we decide we've lost sync
+                if let Some(img) = &gpio_frame {
+                    w = img.width;
+                    h = img.height;
+
+                    if got_gpio_vga_sync > 0 {
+                        got_gpio_vga_sync -= 1;
+                        if got_gpio_vga_sync == 0 {
+                            if let Some(ref streams) = audio_streams {
+                                let _ = streams.gpio.pause();
+                            }
+                        }
+                    }
+                }
+
+                // otherwise show VDP image
+                if video_src == VideoSource::Vdp || got_gpio_vga_sync == 0 {
+                    unsafe {
+                        (*vdp_interface.copyVgaFramebuffer)(
+                            &mut w as *mut u32,
+                            &mut h as *mut u32,
+                            &mut vgabuf[0] as *mut u8,
+                            &mut frame_rate_hz as *mut f32,
+                        );
+                    }
+                }
+
+                if w != mode_w || h != mode_h {
+                    //println!("Mode change to {} x {}", w, h);
+                    mode_w = w;
+                    mode_h = h;
+                    (agon_texture, upscale_texture) =
+                        make_agon_screen_textures(&texture_creator, output_size, (mode_w, mode_h));
+                }
+
+                match args.renderer {
+                    parse_args::Renderer::Software => {
+                        agon_texture.update(None, &vgabuf, 3 * w as usize).unwrap();
+                    }
+                    parse_args::Renderer::Accelerated => {
+                        agon_texture.update(None, &vgabuf, 3 * w as usize).unwrap();
+                        /*
+                         * This is how it's supposed to be done for a streaming texture,
+                         * but it produces a black screen on some systems...
+                        agon_texture.with_lock(Some(sdl3::rect::Rect::new(0, 0, w, h)), |data, pitch| {
+                            let mut i = 0;
+                            for y in 0..h {
+                                let row = y as usize * pitch;
+                                for x in 0..w {
+                                    let col = 3 * x as usize;
+                                    data[row + col] = vgabuf[i];
+                                    data[row + col + 1] = vgabuf[i+1];
+                                    data[row + col + 2] = vgabuf[i+2];
+                                    i += 3;
+                                }
+                             }
+                        }).unwrap();
+                        */
+                    }
+                }
+            }
+
+            /* Keep rendered output to 4:3 aspect ratio */
+            let dst = Some(calc_4_3_output_rect(
+                canvas.output_size().unwrap(),
+                (mode_w, mode_h),
+                screen_scale,
+            ));
+
+            canvas.set_draw_color(sdl3::pixels::Color {
+                r: (args.border >> 16) as u8,
+                g: (args.border >> 8) as u8,
+                b: args.border as u8,
+                a: 0,
+            });
+            canvas.clear();
+
+            if screen_scale == parse_args::ScreenScale::ScaleInteger {
+                // render directly from agon texture, with no filtering (ScaleModeNearest)
+                // to dst that is already calculated as an integer scaling
+                canvas.copy(&agon_texture, None, dst).unwrap();
+            } else {
+                // first perform integer upscale of the agon_texture to upscale_texture
+                canvas.with_texture_canvas(&mut upscale_texture, |c| {
+                    c.copy(&agon_texture, None, None).unwrap();
+                });
+                // then draw upscaled texture to screen (with bilinear/anisotropic filtering)
+                // with dst at arbitrary scaling
+                canvas.copy(&upscale_texture, None, dst).unwrap();
+            }
+            canvas.present();
+        }
+    }
+
+    // signal the shutdown to any other listeners
+    emulator_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // give vdp some time to shutdown
+    unsafe {
+        (*vdp_interface.vdp_shutdown)();
+    }
+    if hybrid_backend {
+        if let Ok(worker) = vdp_thread { let _ = worker.join(); }
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    return exit_status.load(std::sync::atomic::Ordering::Relaxed);
+}
+
+fn calc_int_scale(canvas_size: (u32, u32), agon_size: (u32, u32)) -> (u32, u32) {
+    // Hack to make very non-square pixel modes scale nicely
+    let agon_scr_adj = if agon_size.0 / agon_size.1 >= 2 {
+        (agon_size.0, agon_size.1 * 2)
+    } else {
+        agon_size
+    };
+    let int_scale = u32::max(
+        1,
+        u32::min(
+            canvas_size.0 / agon_scr_adj.0,
+            canvas_size.1 / agon_scr_adj.1,
+        ),
+    );
+    (int_scale * agon_scr_adj.0, int_scale * agon_scr_adj.1)
+}
+
+fn calc_4_3_output_rect(
+    window_size: (u32, u32),
+    agon_scr: (u32, u32),
+    scale: parse_args::ScreenScale,
+) -> sdl3::render::FRect {
+    let (wx, wy) = window_size;
+
+    match scale {
+        parse_args::ScreenScale::StretchAny => {
+            sdl3::render::FRect::new(0.0, 0.0, wx as f32, wy as f32)
+        }
+        parse_args::ScreenScale::ScaleInteger if wx >= agon_scr.0 && wy >= agon_scr.1 => {
+            let scaled_size = calc_int_scale((wx, wy), agon_scr);
+            let offx = ((wx - scaled_size.0) / 2) as i32;
+            let offy = ((wy - scaled_size.1) / 2) as i32;
+            return sdl3::render::FRect::new(
+                offx as f32,
+                offy as f32,
+                scaled_size.0 as f32,
+                scaled_size.1 as f32,
+            );
+        }
+        _ => {
+            if wx > 4 * wy / 3 {
+                sdl3::render::FRect::new(
+                    ((wx as i32 - 4 * wy as i32 / 3) >> 1) as f32,
+                    0.0,
+                    (4 * wy / 3) as f32,
+                    wy as f32,
+                )
+            } else {
+                sdl3::render::FRect::new(
+                    0.0,
+                    ((wy as i32 - 3 * wx as i32 / 4) >> 1) as f32,
+                    wx as f32,
+                    (3 * wx / 4) as f32,
+                )
+            }
+        }
+    }
+}
+
+fn open_joystick_devices(
+    joysticks: &mut Vec<sdl3::joystick::Joystick>,
+    joystick_subsystem: &sdl3::JoystickSubsystem,
+) {
+    joysticks.clear();
+
+    match joystick_subsystem.joysticks() {
+        Ok(sticks) => {
+            for handle in &sticks {
+                joysticks.push(joystick_subsystem.open(*handle).unwrap());
+            }
+        }
+        Err(e) => {
+            eprintln!("Error opening joysticks: {}", e);
+        }
+    }
+}
+
+/**
+ * Make 2 textures:
+ * @return.0 the size of the agon screen (to copy the agon framebuffer to directly)
+ * @return.1 and another an integer scaling of this, to provide a clean upscale for subsequent
+ *           bilinear-filtered rendering to the SDL screen.
+ */
+fn make_agon_screen_textures(
+    texture_creator: &sdl3::render::TextureCreator<sdl3::video::WindowContext>,
+    native_size: (u32, u32),
+    agon_size: (u32, u32),
+) -> (sdl3::render::Texture, sdl3::render::Texture) {
+    let texture = texture_creator
+        .create_texture_streaming(
+            unsafe {
+                sdl3::pixels::PixelFormat::from_ll(sdl3_sys::everything::SDL_PixelFormat::RGB24)
+            },
+            agon_size.0,
+            agon_size.1,
+        )
+        .unwrap();
+    // Use nearest filtering for integer upscale
+    unsafe {
+        SDL_SetTextureScaleMode(texture.raw(), SDL_ScaleMode::NEAREST);
+    }
+    //println!("native size {:?}", native_size);
+    let int_scale_size = calc_int_scale(native_size, agon_size);
+    //println!("texture int scale {:?}", int_scale_size);
+    let upscale_texture = texture_creator
+        .create_texture_target(
+            unsafe {
+                sdl3::pixels::PixelFormat::from_ll(sdl3_sys::everything::SDL_PixelFormat::RGB24)
+            },
+            int_scale_size.0,
+            int_scale_size.1,
+        )
+        .unwrap();
+    // enable linear filtering of final blit from integer-upscaled agon screen to the SDL screen
+    unsafe {
+        SDL_SetTextureScaleMode(upscale_texture.raw(), SDL_ScaleMode::LINEAR);
+    }
+
+    (texture, upscale_texture)
+}

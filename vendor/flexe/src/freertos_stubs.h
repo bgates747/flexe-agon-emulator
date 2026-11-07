@@ -1,0 +1,71 @@
+#ifndef FREERTOS_STUBS_H
+#define FREERTOS_STUBS_H
+
+#include <stdio.h>
+#include "xtensa.h"
+#include "elf_symbols.h"
+
+typedef struct freertos_stubs freertos_stubs_t;
+
+freertos_stubs_t *freertos_stubs_create(xtensa_cpu_t *cpu);
+void freertos_stubs_destroy(freertos_stubs_t *frt);
+
+/* Register a second CPU for dual-core scheduling */
+void freertos_stubs_attach_cpu(freertos_stubs_t *frt, int core_id, xtensa_cpu_t *cpu);
+
+/* Look up ELF symbols and register PC hooks for FreeRTOS functions */
+int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms);
+
+/* Access the bump allocator pointer (for testing) */
+uint32_t freertos_stubs_bump_ptr(const freertos_stubs_t *frt);
+
+/* Get deferred task info (saved by xTaskCreate/xTaskCreatePinnedToCore) */
+uint32_t freertos_stubs_deferred_task(const freertos_stubs_t *frt, uint32_t *param_out);
+
+/* Consume (get and clear) the deferred task — one-shot, returns 0 on second call.
+ * If multiple tasks were registered, starts the cooperative scheduler and returns 0. */
+uint32_t freertos_stubs_consume_deferred_task(freertos_stubs_t *frt, uint32_t *param_out);
+
+/* Event callback: called on task switches */
+typedef void (*freertos_event_fn)(const char *from, const char *to,
+                                   uint64_t cycle, void *ctx);
+void freertos_stubs_set_event_fn(freertos_stubs_t *frt, freertos_event_fn fn, void *ctx);
+
+/* Current task name for a specific core (for heartbeat display) */
+const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt, int core_id);
+
+/* Dump the task table (name, state, saved PC/regs) into buf for debugging.
+ * Returns number of bytes written (excluding NUL). */
+int freertos_stubs_dump_tasks(const freertos_stubs_t *frt, char *buf, int buflen);
+
+/* Returns true if the cooperative scheduler is running (multi-task mode) */
+bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt);
+
+/* Block the running task for `us` microseconds of guest time, using the same
+ * scheduler and clock as vTaskDelay(). Returns true if the scheduler took
+ * ownership (the guest return has already been performed and a context switch
+ * made, so the caller must not write a return value). */
+bool freertos_stubs_sleep_us(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
+                             uint64_t us);
+
+/* Deliver any software timers that have come due. Call once per execution
+ * batch, outside any FreeRTOS lock: callbacks re-enter guest code. */
+void freertos_stubs_tick(freertos_stubs_t *frt);
+
+/* Start the cooperative scheduler (called on self-loop detection) */
+void freertos_stubs_start_scheduler(freertos_stubs_t *frt);
+
+/* Check if current task's timeslice expired; if so, preempt.
+ * Call from main run loop after each xtensa_run() batch. */
+bool freertos_stubs_check_preempt(freertos_stubs_t *frt);
+
+/* Per-core preemption check for dual-core mode */
+bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id);
+
+/* Save FreeRTOS state to file (for checkpoint/restore) */
+int freertos_stubs_save_state(const freertos_stubs_t *frt, FILE *f);
+
+/* Restore FreeRTOS state from file (for checkpoint/restore) */
+int freertos_stubs_restore_state(freertos_stubs_t *frt, FILE *f);
+
+#endif /* FREERTOS_STUBS_H */

@@ -1,0 +1,793 @@
+{
+  "date": "2026-11-06",
+  "scope": "Locked Linux workspace dependency census for this source-only candidate; no firmware, assets, host shared libraries or binaries bundled. Licence declarations are not a replacement for the actual component notices.",
+  "cargo_lock_sha256": "b80ae5fa9f046c15e8222570fe0749ed907ff0664beafd6cf657555d1eff5405",
+  "package_count": 64,
+  "packages": [
+    {
+      "name": "agon-cli-emulator",
+      "version": "0.1.0",
+      "authors": [
+        "Tom Morton <tomm8086@gmail.com>"
+      ],
+      "declared_license": "GPL-3.0",
+      "license_file": null,
+      "repository": null,
+      "source": null,
+      "scope": "workspace package"
+    },
+    {
+      "name": "agon-ez80-emulator",
+      "version": "0.1.0",
+      "authors": [
+        "Tom Morton <tomm8086@gmail.com>"
+      ],
+      "declared_license": "GPL-3.0",
+      "license_file": null,
+      "repository": null,
+      "source": null,
+      "scope": "workspace package"
+    },
+    {
+      "name": "agon-light-emulator-debugger",
+      "version": "0.1.0",
+      "authors": [
+        "Tom Morton <tomm8086@gmail.com>"
+      ],
+      "declared_license": "GPL-3.0",
+      "license_file": null,
+      "repository": null,
+      "source": null,
+      "scope": "workspace package"
+    },
+    {
+      "name": "autocfg",
+      "version": "1.3.0",
+      "authors": [
+        "Josh Stone <cuviper@gmail.com>"
+      ],
+      "declared_license": "Apache-2.0 OR MIT",
+      "license_file": null,
+      "repository": "https://github.com/cuviper/autocfg",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "bitflags",
+      "version": "1.3.2",
+      "authors": [
+        "The Rust Project Developers"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/bitflags/bitflags",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "bitflags",
+      "version": "2.9.1",
+      "authors": [
+        "The Rust Project Developers"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/bitflags/bitflags",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "cfg-if",
+      "version": "1.0.0",
+      "authors": [
+        "Alex Crichton <alex@alexcrichton.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/alexcrichton/cfg-if",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "chrono",
+      "version": "0.4.38",
+      "authors": [],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/chronotope/chrono",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "ctrlc",
+      "version": "3.4.2",
+      "authors": [
+        "Antti Ker\u00e4nen <detegr@gmail.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/Detegr/rust-ctrlc.git",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "derive_more",
+      "version": "0.14.1",
+      "authors": [
+        "Jelte Fennema <github-tech@jeltef.nl>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/JelteF/derive_more",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "endian-type",
+      "version": "0.1.2",
+      "authors": [
+        "Lolirofle <lolipopple@hotmail.com>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/Lolirofle/endian-type.git",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "errno",
+      "version": "0.3.8",
+      "authors": [
+        "Chris Wong <lambda.fairy@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/lambda-fairy/rust-errno",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "ez80",
+      "version": "0.4.3",
+      "authors": [
+        "Tom Morton <tomm8086@gmail.com>",
+        "Ivan Izaguirre <ivanizag@gmail.com>"
+      ],
+      "declared_license": "BSD-3-Clause",
+      "license_file": null,
+      "repository": "https://github.com/tomm/ez80",
+      "source": "git+https://github.com/tomm/ez80.git?rev=13c151e89f520b3bae3343bea9d67d06e8037cfa#13c151e89f520b3bae3343bea9d67d06e8037cfa",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "fd-lock",
+      "version": "3.0.13",
+      "authors": [
+        "Yoshua Wuyts <yoshuawuyts@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/yoshuawuyts/fd-lock",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "filetime",
+      "version": "0.2.23",
+      "authors": [
+        "Alex Crichton <alex@alexcrichton.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/alexcrichton/filetime",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "flexe-agon-emulator",
+      "version": "0.1.0",
+      "authors": [
+        "Tom Morton <tomm8086@gmail.com>"
+      ],
+      "declared_license": "GPL-3.0",
+      "license_file": null,
+      "repository": "https://github.com/bgates747/flex-agon-emulator",
+      "source": null,
+      "scope": "workspace package"
+    },
+    {
+      "name": "getrandom",
+      "version": "0.2.12",
+      "authors": [
+        "The Rand Project Developers"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-random/getrandom",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "home",
+      "version": "0.5.9",
+      "authors": [
+        "Brian Anderson <andersrb@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-lang/cargo",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "iana-time-zone",
+      "version": "0.1.60",
+      "authors": [
+        "Andrew Straw <strawman@astraw.com>",
+        "Ren\u00e9 Kijewski <rene.kijewski@fu-berlin.de>",
+        "Ryan Lopopolo <rjl@hyperbo.la>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/strawlab/iana-time-zone",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "inline_colorization",
+      "version": "0.1.6",
+      "authors": [
+        "Elias Jonsson <e@ejon.eu>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": null,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "lazy_static",
+      "version": "1.4.0",
+      "authors": [
+        "Marvin L\u00f6bel <loebel.marvin@gmail.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-lang-nursery/lazy-static.rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "libc",
+      "version": "0.2.174",
+      "authors": [
+        "The Rust Project Developers"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-lang/libc",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "libloading",
+      "version": "0.8.1",
+      "authors": [
+        "Simonas Kazlauskas <libloading@kazlauskas.me>"
+      ],
+      "declared_license": "ISC",
+      "license_file": null,
+      "repository": "https://github.com/nagisa/rust_libloading/",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "libudev",
+      "version": "0.3.0",
+      "authors": [
+        "David Cuddeback <david.cuddeback@gmail.com>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/dcuddeback/libudev-rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "libudev-sys",
+      "version": "0.1.4",
+      "authors": [
+        "David Cuddeback <david.cuddeback@gmail.com>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/dcuddeback/libudev-sys",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "linux-raw-sys",
+      "version": "0.4.13",
+      "authors": [
+        "Dan Gohman <dev@sunfishcode.online>"
+      ],
+      "declared_license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "license_file": null,
+      "repository": "https://github.com/sunfishcode/linux-raw-sys",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "log",
+      "version": "0.4.20",
+      "authors": [
+        "The Rust Project Developers"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-lang/log",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "memchr",
+      "version": "2.7.1",
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>",
+        "bluss"
+      ],
+      "declared_license": "Unlicense OR MIT",
+      "license_file": null,
+      "repository": "https://github.com/BurntSushi/memchr",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "nibble_vec",
+      "version": "0.1.0",
+      "authors": [
+        "Michael Sproul <micsproul@gmail.com>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/michaelsproul/rust_nibble_vec",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "nix",
+      "version": "0.26.4",
+      "authors": [
+        "The nix-rust Project Developers"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/nix-rust/nix",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "nix",
+      "version": "0.27.1",
+      "authors": [
+        "The nix-rust Project Developers"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/nix-rust/nix",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "num-traits",
+      "version": "0.2.19",
+      "authors": [
+        "The Rust Project Developers"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-num/num-traits",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "pico-args",
+      "version": "0.5.0",
+      "authors": [
+        "Yevhenii Reizner <razrfalcon@gmail.com>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/RazrFalcon/pico-args",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "pkg-config",
+      "version": "0.3.29",
+      "authors": [
+        "Alex Crichton <alex@alexcrichton.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-lang/pkg-config-rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "ppv-lite86",
+      "version": "0.2.17",
+      "authors": [
+        "The CryptoCorrosion Contributors"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/cryptocorrosion/cryptocorrosion",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "proc-macro2",
+      "version": "0.4.30",
+      "authors": [
+        "Alex Crichton <alex@alexcrichton.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/alexcrichton/proc-macro2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "proc-macro2",
+      "version": "1.0.78",
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>",
+        "Alex Crichton <alex@alexcrichton.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/dtolnay/proc-macro2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "quote",
+      "version": "0.6.13",
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/dtolnay/quote",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "quote",
+      "version": "1.0.35",
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/dtolnay/quote",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "radix_trie",
+      "version": "0.2.1",
+      "authors": [
+        "Michael Sproul <micsproul@gmail.com>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/michaelsproul/rust_radix_trie",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "rand",
+      "version": "0.8.5",
+      "authors": [
+        "The Rand Project Developers",
+        "The Rust Project Developers"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-random/rand",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "rand_chacha",
+      "version": "0.3.1",
+      "authors": [
+        "The Rand Project Developers",
+        "The Rust Project Developers",
+        "The CryptoCorrosion Contributors"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-random/rand",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "rand_core",
+      "version": "0.6.4",
+      "authors": [
+        "The Rand Project Developers",
+        "The Rust Project Developers"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/rust-random/rand",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "raw_tty",
+      "version": "0.1.0",
+      "authors": [
+        "Ashkan Kiani <ashkan.k.kiani@gmail.com>"
+      ],
+      "declared_license": "Apache-2.0 OR MIT",
+      "license_file": null,
+      "repository": "https://github.com/norcalli/raw_tty.rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "rustc_version",
+      "version": "0.2.3",
+      "authors": [
+        "Marvin L\u00f6bel <loebel.marvin@gmail.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/Kimundi/rustc-version-rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "rustix",
+      "version": "0.38.30",
+      "authors": [
+        "Dan Gohman <dev@sunfishcode.online>",
+        "Jakub Konka <kubkon@jakubkonka.com>"
+      ],
+      "declared_license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "license_file": null,
+      "repository": "https://github.com/bytecodealliance/rustix",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "rustyline",
+      "version": "12.0.0",
+      "authors": [
+        "Katsu Kawakami <kkawa1570@gmail.com>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/kkawakam/rustyline",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "scopeguard",
+      "version": "1.2.0",
+      "authors": [
+        "bluss"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/bluss/scopeguard",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "sdl3",
+      "version": "0.14.36",
+      "authors": [
+        "Tony Aldridge <tony@angry-lawyer.com>",
+        "Cobrand <cobrandw@gmail.com>",
+        "Mischa Spiegelmock <me@mish.dev>",
+        "Lokathor <@Lokathor@mastodon.social>"
+      ],
+      "declared_license": "MIT",
+      "license_file": null,
+      "repository": "https://github.com/vhspace/sdl3-rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "sdl3-sys",
+      "version": "0.5.3+SDL3-3.2.18",
+      "authors": [
+        "Maia S Ravn <maia.noreply@runbox.com>"
+      ],
+      "declared_license": "Zlib",
+      "license_file": null,
+      "repository": "https://github.com/maia-s/sdl3-sys-rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "semver",
+      "version": "0.9.0",
+      "authors": [
+        "Steve Klabnik <steve@steveklabnik.com>",
+        "The Rust Project Developers"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/steveklabnik/semver",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "semver-parser",
+      "version": "0.7.0",
+      "authors": [
+        "Steve Klabnik <steve@steveklabnik.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/steveklabnik/semver-parser",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "serialport",
+      "version": "4.3.0",
+      "authors": [
+        "Bryant Mairs <bryant@mai.rs>",
+        "Jesse Braham <jesse@beta7.io>"
+      ],
+      "declared_license": "MPL-2.0",
+      "license_file": null,
+      "repository": "https://github.com/serialport/serialport-rs",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "smallvec",
+      "version": "1.13.1",
+      "authors": [
+        "The Servo Project Developers"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/servo/rust-smallvec",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "syn",
+      "version": "0.15.44",
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/dtolnay/syn",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "syn",
+      "version": "2.0.48",
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/dtolnay/syn",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "thiserror",
+      "version": "1.0.57",
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/dtolnay/thiserror",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "thiserror-impl",
+      "version": "1.0.57",
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ],
+      "declared_license": "MIT OR Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/dtolnay/thiserror",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "unescaper",
+      "version": "0.1.4",
+      "authors": [
+        "Xavier Lau <xavier@inv.cafe>"
+      ],
+      "declared_license": "GPL-3.0/MIT",
+      "license_file": null,
+      "repository": "https://github.com/hack-ink/unescaper",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "unicode-ident",
+      "version": "1.0.12",
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
+      ],
+      "declared_license": "(MIT OR Apache-2.0) AND Unicode-DFS-2016",
+      "license_file": null,
+      "repository": "https://github.com/dtolnay/unicode-ident",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "unicode-segmentation",
+      "version": "1.10.1",
+      "authors": [
+        "kwantam <kwantam@gmail.com>",
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/unicode-rs/unicode-segmentation",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "unicode-width",
+      "version": "0.1.11",
+      "authors": [
+        "kwantam <kwantam@gmail.com>",
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/unicode-rs/unicode-width",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "unicode-xid",
+      "version": "0.1.0",
+      "authors": [
+        "erick.tryzelaar <erick.tryzelaar@gmail.com>",
+        "kwantam <kwantam@gmail.com>"
+      ],
+      "declared_license": "MIT/Apache-2.0",
+      "license_file": null,
+      "repository": "https://github.com/unicode-rs/unicode-xid",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    },
+    {
+      "name": "utf8parse",
+      "version": "0.2.1",
+      "authors": [
+        "Joe Wilm <joe@jwilm.com>",
+        "Christian Duerr <contact@christianduerr.com>"
+      ],
+      "declared_license": "Apache-2.0 OR MIT",
+      "license_file": null,
+      "repository": "https://github.com/alacritty/vte",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "scope": "locked dependency"
+    }
+  ]
+}

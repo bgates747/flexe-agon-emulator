@@ -1,0 +1,5 @@
+/build/
+/target/
+/.emulator/
+/dist/
+__pycache__/

@@ -1,0 +1,283 @@
+#ifndef MEMORY_H
+#define MEMORY_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdio.h>
+#include "target_types.h"
+
+#ifdef _MSC_VER
+#include "msvc_compat.h"
+#endif
+
+/* MMIO callback types */
+typedef uint32_t (*mmio_read_fn)(void *ctx, uint32_t addr);
+typedef void     (*mmio_write_fn)(void *ctx, uint32_t addr, uint32_t val);
+/* Byte-enable-aware writes receive a word-aligned address plus lane-positioned
+ * data and mask.  A byte store of 0xAB at register+1 is therefore delivered
+ * as value=0x0000AB00, mask=0x0000FF00.  Devices with W1C, FIFO, or strobe
+ * registers can implement the bus transaction without a synthetic read. */
+typedef void (*mmio_masked_write_fn)(void *ctx, uint32_t addr,
+                                     uint32_t val, uint32_t mask);
+
+/* Constants for struct definition */
+#define MEM_PAGE_TABLE_SIZE (1u << 20)  /* 1M pages covering 4GB */
+
+typedef struct {
+    mmio_read_fn  read;
+    mmio_write_fn write;
+    mmio_masked_write_fn masked_write;
+    void         *ctx;
+} mmio_handler_t;
+
+/* Full struct exposed for inline access in hot path */
+struct xtensa_mem {
+    const flexe_target_desc_t *target;
+    uint8_t *sram;
+    uint8_t *rom;
+    uint8_t *flash_data;
+    uint8_t *flash_insn;
+    uint8_t *rtc_dram;
+    uint8_t *rtc_slow;
+    uint8_t *psram;
+    uint32_t backing_size[FLEXE_MEM_BACKING_COUNT];
+    uint32_t flash_usable_size;
+    mmio_handler_t *mmio;
+    uint32_t mmio_page_count;
+
+    /* Accesses matching no RAM page and no MMIO handler. Reads return 0 and
+     * writes are dropped -- see note_unmapped() for why that is deliberate and
+     * why it is worth counting anyway. */
+    uint64_t unmapped_count;
+    uint32_t unmapped_first;
+    uint8_t *page_table[MEM_PAGE_TABLE_SIZE];
+};
+
+typedef struct xtensa_mem xtensa_mem_t;
+
+/* Lifecycle */
+xtensa_mem_t *mem_create(void);
+xtensa_mem_t *mem_create_for_target(const flexe_target_desc_t *target);
+xtensa_mem_t *mem_create_for_target_with_flash(
+    const flexe_target_desc_t *target, uint32_t required_flash_size);
+void mem_destroy(xtensa_mem_t *mem);
+void mem_reset(xtensa_mem_t *mem);
+
+const flexe_target_desc_t *mem_target(const xtensa_mem_t *mem);
+uint32_t mem_backing_size(const xtensa_mem_t *mem,
+                          flexe_mem_backing_t backing);
+uint8_t *mem_backing_ptr(xtensa_mem_t *mem, flexe_mem_backing_t backing);
+
+/* Physical NOR capacity and application-visible capacity can differ when an
+ * image was linked for less flash than the attached virtual device. */
+uint32_t mem_flash_physical_size(const xtensa_mem_t *mem);
+uint32_t mem_flash_usable_size(const xtensa_mem_t *mem);
+uint32_t mem_flash_jedec_id(const xtensa_mem_t *mem);
+
+/* Reconstruct the target-described bootloader-to-application ROM flash
+ * handoff. `live_data_address` is resolved directly from the descriptor or
+ * from its official ROM-ELF pointer symbol. */
+int mem_prepare_rom_flash(xtensa_mem_t *mem, uint32_t live_data_address,
+                          uint32_t usable_flash_size);
+
+/* Install or remove page-table mappings without exposing page_table to SoC
+ * devices. All arguments are 4 KiB aligned and size is non-zero. A mapping
+ * aliases an existing target backing; it never allocates or copies bytes. */
+int mem_map_backing_range(xtensa_mem_t *mem, uint32_t virtual_addr,
+                          flexe_mem_backing_t backing,
+                          uint32_t backing_offset, uint32_t size);
+int mem_unmap_range(xtensa_mem_t *mem, uint32_t virtual_addr, uint32_t size);
+
+/* Bulk load */
+int mem_load(xtensa_mem_t *mem, uint32_t addr, const uint8_t *data, size_t len);
+int mem_load_flash(xtensa_mem_t *mem, const uint8_t *data, size_t len);
+
+/* MMIO peripheral registration */
+int mem_register_mmio(xtensa_mem_t *mem, int page_index,
+                      mmio_read_fn read_fn, mmio_write_fn write_fn, void *ctx);
+int mem_register_mmio_range(xtensa_mem_t *mem, uint32_t base, uint32_t size,
+                            mmio_read_fn read_fn, mmio_write_fn write_fn, void *ctx);
+int mem_register_mmio_masked(
+    xtensa_mem_t *mem, int page_index, mmio_read_fn read_fn,
+    mmio_masked_write_fn write_fn, void *ctx);
+int mem_register_mmio_masked_range(
+    xtensa_mem_t *mem, uint32_t base, uint32_t size, mmio_read_fn read_fn,
+    mmio_masked_write_fn write_fn, void *ctx);
+
+static inline uint32_t mmio_merge_write(uint32_t old_value,
+                                        uint32_t write_value,
+                                        uint32_t write_mask) {
+    return (old_value & ~write_mask) | (write_value & write_mask);
+}
+
+/* MMIO slow-path functions (called from inline fast paths on page table miss) */
+uint32_t mem_read32_slow(xtensa_mem_t *mem, uint32_t addr);
+
+/* Accesses that matched no RAM page and no MMIO handler. A non-zero count
+ * usually means the firmware dereferenced a null or wild pointer -- hardware
+ * would have raised LoadProhibited there, while Flexe reads 0 and carries on,
+ * so an otherwise silent hang shows up here. */
+uint64_t mem_unmapped_count(const xtensa_mem_t *mem);
+uint32_t mem_unmapped_first(const xtensa_mem_t *mem);
+uint16_t mem_read16_slow(xtensa_mem_t *mem, uint32_t addr);
+uint8_t  mem_read8_slow(xtensa_mem_t *mem, uint32_t addr);
+void     mem_write32_slow(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
+void     mem_write16_slow(xtensa_mem_t *mem, uint32_t addr, uint16_t val);
+void     mem_write8_slow(xtensa_mem_t *mem, uint32_t addr, uint8_t val);
+
+/*
+ * Inline fast-path memory access.
+ * Page table hit (~99% of accesses) → single pointer arithmetic + memcpy.
+ * Miss → fall through to MMIO slow path in memory.c.
+ */
+
+/* Resolve guest address to host pointer (read-only).
+ * Returns NULL for MMIO or unmapped addresses. */
+static inline const uint8_t *mem_get_ptr(xtensa_mem_t *mem, uint32_t addr) {
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1))
+        return page + (addr & 0xFFF);
+    return NULL;
+}
+
+/* Resolve guest address to writable host pointer.
+ * Returns NULL for MMIO or unmapped addresses. */
+static inline uint8_t *mem_get_ptr_w(xtensa_mem_t *mem, uint32_t addr) {
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1))
+        return page + (addr & 0xFFF);
+    return NULL;
+}
+
+static inline __attribute__((always_inline)) uint8_t mem_read8(xtensa_mem_t *mem, uint32_t addr) {
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1))
+        return page[addr & 0xFFF];
+    return mem_read8_slow(mem, addr);
+}
+
+static inline __attribute__((always_inline)) uint16_t mem_read16(xtensa_mem_t *mem, uint32_t addr) {
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1)) {
+        uint16_t val;
+        memcpy(&val, page + (addr & 0xFFF), 2);
+        return val;
+    }
+    return mem_read16_slow(mem, addr);
+}
+
+static inline __attribute__((always_inline)) uint32_t mem_read32(xtensa_mem_t *mem, uint32_t addr) {
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1)) {
+        uint32_t val;
+        memcpy(&val, page + (addr & 0xFFF), 4);
+        return val;
+    }
+    return mem_read32_slow(mem, addr);
+}
+
+
+/* ===== Speculative-write journal =====
+ *
+ * Records the pre-write contents of every RAM word a run touches so the run
+ * can be undone. The JIT's differential verify mode needs this: it has to
+ * execute the same guest instructions twice -- once natively, once
+ * interpreted -- and a block containing a read-modify-write would otherwise
+ * apply its update twice.
+ *
+ * MMIO is deliberately *not* journalled. Reading a device register to save it
+ * can itself have side effects, and replaying a device write is not
+ * meaningful, so any MMIO touch marks the window unreplayable and the
+ * verifier skips that block rather than guessing.
+ *
+ * Entirely inert when disabled: one predicted-not-taken test per store.
+ */
+#define MEM_JOURNAL_MAX 8192
+typedef struct { uint32_t addr; uint32_t old; } mem_journal_entry_t;
+extern int      g_mem_journal_en;       /* 1 = recording */
+extern int      g_mem_journal_unsafe;   /* MMIO touched, or capacity exceeded */
+extern int      g_mem_journal_count;
+extern mem_journal_entry_t g_mem_journal[MEM_JOURNAL_MAX];
+
+void mem_write8_journaled(xtensa_mem_t *mem, uint32_t addr, uint8_t val);
+void mem_write16_journaled(xtensa_mem_t *mem, uint32_t addr, uint16_t val);
+void mem_write32_journaled(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
+
+void mem_journal_begin(void);
+void mem_journal_pause(void);
+void mem_journal_rollback(xtensa_mem_t *mem);
+void mem_journal_end(void);
+
+static inline void mem_journal_word(xtensa_mem_t *mem, uint32_t addr) {
+    uint32_t w = addr & ~3u;
+    uint8_t *page = mem->page_table[w >> 12];
+    if (!page) { g_mem_journal_unsafe = 1; return; }
+    if (g_mem_journal_count >= MEM_JOURNAL_MAX) {
+        g_mem_journal_unsafe = 1;
+        return;
+    }
+    mem_journal_entry_t *e = &g_mem_journal[g_mem_journal_count++];
+    e->addr = w;
+    memcpy(&e->old, page + (w & 0xFFF), 4);
+}
+
+/* Journal every word an access of `len` bytes at `addr` can reach. */
+static inline void mem_journal_note(xtensa_mem_t *mem, uint32_t addr,
+                                    unsigned len) {
+    mem_journal_word(mem, addr);
+    uint32_t last = addr + len - 1u;
+    if ((last & ~3u) != (addr & ~3u)) mem_journal_word(mem, last);
+}
+
+static inline __attribute__((always_inline)) void mem_write8(xtensa_mem_t *mem, uint32_t addr, uint8_t val) {
+    if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 1);
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1)) {
+        page[addr & 0xFFF] = val;
+        return;
+    }
+    mem_write8_slow(mem, addr, val);
+}
+
+static inline __attribute__((always_inline)) void mem_write16(xtensa_mem_t *mem, uint32_t addr, uint16_t val) {
+    if (__builtin_expect(g_mem_journal_en, 0)) mem_journal_note(mem, addr, 2);
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1)) {
+        memcpy(page + (addr & 0xFFF), &val, 2);
+        return;
+    }
+    mem_write16_slow(mem, addr, val);
+}
+
+extern uint32_t g_dbg_pc;
+extern int g_dbg_core;
+extern int g_dbg_watch_en;
+extern uint32_t g_dbg_watch_addr;
+extern int g_dbg_pcwatch_en;
+extern uint32_t g_dbg_pcwatch;
+extern uint32_t g_dbg_pcwatch2;
+extern uint32_t g_dbg_watch_addr2;
+extern uint32_t g_dbg_watch_val;
+
+/* Address / value / storing-PC watchpoints (FLEXE_WATCH, FLEXE_WATCHVAL,
+ * FLEXE_PCWATCH). This is the hottest store path in the emulator, so every
+ * optional observer is collapsed into one gate and the work lives out of line
+ * in memory.c. */
+extern int g_dbg_mem_watch;
+extern int g_mem_write32_observe;
+void mem_write32_observers_refresh(void);
+void mem_write32_observed(xtensa_mem_t *mem, uint32_t addr, uint32_t val);
+
+static inline __attribute__((always_inline)) void mem_write32(xtensa_mem_t *mem, uint32_t addr, uint32_t val) {
+    if (__builtin_expect(g_mem_write32_observe, 0))
+        mem_write32_observed(mem, addr, val);
+    uint8_t *page = mem->page_table[addr >> 12];
+    if (__builtin_expect(page != NULL, 1)) {
+        memcpy(page + (addr & 0xFFF), &val, 4);
+        return;
+    }
+    mem_write32_slow(mem, addr, val);
+}
+
+#endif /* MEMORY_H */

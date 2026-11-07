@@ -1,0 +1,381 @@
+#include "savestate.h"
+#include "target.h"
+#include "xtensa.h"
+#include "memory.h"
+#include "freertos_stubs.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+
+/* Helper macros for safe file I/O */
+#define WRITE_OR_FAIL(f, ptr, size, msg) \
+    do { \
+        if (fwrite(ptr, 1, size, f) != size) { \
+            fprintf(stderr, "savestate_save: failed to write %s: %s\n", msg, strerror(errno)); \
+            fclose(f); \
+            return -1; \
+        } \
+    } while (0)
+
+#define READ_OR_FAIL(f, ptr, size, msg) \
+    do { \
+        if (fread(ptr, 1, size, f) != size) { \
+            fprintf(stderr, "savestate_restore: failed to read %s: %s\n", msg, strerror(errno)); \
+            fclose(f); \
+            return -1; \
+        } \
+    } while (0)
+
+/*
+ * Save complete emulator state to file.
+ */
+int savestate_save(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path, const char *description) {
+    if (!cpu || !cpu->mem || !mem_target(cpu->mem) || !path) {
+        fprintf(stderr, "savestate_save: null argument\n");
+        return -1;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "savestate_save: failed to open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    /* Prepare header */
+    savestate_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = SAVESTATE_MAGIC;
+    hdr.version = SAVESTATE_VERSION;
+    hdr.cycle_count = cpu->cycle_count;
+    hdr.insn_count = cpu->insn_count;
+    hdr.timestamp = (uint64_t)time(NULL);
+
+    if (description) {
+        strncpy(hdr.description, description, sizeof(hdr.description) - 1);
+        hdr.description[sizeof(hdr.description) - 1] = '\0';
+    } else {
+        snprintf(hdr.description, sizeof(hdr.description), "checkpoint-%llu",
+                 (unsigned long long)hdr.cycle_count);
+    }
+
+    hdr.target_id = (uint32_t)mem_target(cpu->mem)->id;
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++)
+        hdr.backing_size[i] =
+            mem_backing_size(cpu->mem, (flexe_mem_backing_t)i);
+    hdr.compressed = 0;
+    hdr.differential = 0;
+
+    /* Write header */
+    WRITE_OR_FAIL(f, &hdr, sizeof(hdr), "header");
+
+    /* === CPU State === */
+    /* General-purpose registers (64 physical registers) */
+    WRITE_OR_FAIL(f, cpu->ar, sizeof(cpu->ar), "AR registers");
+
+    /* Program counter */
+    WRITE_OR_FAIL(f, &cpu->pc, sizeof(cpu->pc), "PC");
+
+    /* Special registers */
+    WRITE_OR_FAIL(f, &cpu->sar, sizeof(cpu->sar), "SAR");
+    WRITE_OR_FAIL(f, &cpu->lbeg, sizeof(cpu->lbeg), "LBEG");
+    WRITE_OR_FAIL(f, &cpu->lend, sizeof(cpu->lend), "LEND");
+    WRITE_OR_FAIL(f, &cpu->lcount, sizeof(cpu->lcount), "LCOUNT");
+    WRITE_OR_FAIL(f, &cpu->windowbase, sizeof(cpu->windowbase), "WINDOWBASE");
+    WRITE_OR_FAIL(f, &cpu->windowstart, sizeof(cpu->windowstart), "WINDOWSTART");
+    WRITE_OR_FAIL(f, &cpu->ps, sizeof(cpu->ps), "PS");
+    WRITE_OR_FAIL(f, &cpu->vecbase, sizeof(cpu->vecbase), "VECBASE");
+    WRITE_OR_FAIL(f, &cpu->exccause, sizeof(cpu->exccause), "EXCCAUSE");
+    WRITE_OR_FAIL(f, &cpu->excvaddr, sizeof(cpu->excvaddr), "EXCVADDR");
+    WRITE_OR_FAIL(f, cpu->epc, sizeof(cpu->epc), "EPC");
+    WRITE_OR_FAIL(f, cpu->eps, sizeof(cpu->eps), "EPS");
+    WRITE_OR_FAIL(f, cpu->excsave, sizeof(cpu->excsave), "EXCSAVE");
+    WRITE_OR_FAIL(f, &cpu->depc, sizeof(cpu->depc), "DEPC");
+    WRITE_OR_FAIL(f, &cpu->ccount, sizeof(cpu->ccount), "CCOUNT");
+    WRITE_OR_FAIL(f, cpu->ccompare, sizeof(cpu->ccompare), "CCOMPARE");
+    WRITE_OR_FAIL(f, &cpu->next_timer_event, sizeof(cpu->next_timer_event), "NEXT_TIMER_EVENT");
+    WRITE_OR_FAIL(f, &cpu->scompare1, sizeof(cpu->scompare1), "SCOMPARE1");
+    WRITE_OR_FAIL(f, cpu->misc, sizeof(cpu->misc), "MISC");
+    WRITE_OR_FAIL(f, &cpu->litbase, sizeof(cpu->litbase), "LITBASE");
+    WRITE_OR_FAIL(f, &cpu->atomctl, sizeof(cpu->atomctl), "ATOMCTL");
+    WRITE_OR_FAIL(f, &cpu->memctl, sizeof(cpu->memctl), "MEMCTL");
+    WRITE_OR_FAIL(f, &cpu->icount, sizeof(cpu->icount), "ICOUNT");
+    WRITE_OR_FAIL(f, &cpu->icountlevel, sizeof(cpu->icountlevel), "ICOUNTLEVEL");
+    WRITE_OR_FAIL(f, &cpu->debugcause, sizeof(cpu->debugcause), "DEBUGCAUSE");
+    WRITE_OR_FAIL(f, &cpu->ibreakenable, sizeof(cpu->ibreakenable), "IBREAKENABLE");
+    WRITE_OR_FAIL(f, cpu->ibreaka, sizeof(cpu->ibreaka), "IBREAKA");
+    WRITE_OR_FAIL(f, cpu->dbreaka, sizeof(cpu->dbreaka), "DBREAKA");
+    WRITE_OR_FAIL(f, cpu->dbreakc, sizeof(cpu->dbreakc), "DBREAKC");
+    WRITE_OR_FAIL(f, &cpu->configid0, sizeof(cpu->configid0), "CONFIGID0");
+    WRITE_OR_FAIL(f, &cpu->configid1, sizeof(cpu->configid1), "CONFIGID1");
+    WRITE_OR_FAIL(f, &cpu->prid, sizeof(cpu->prid), "PRID");
+    WRITE_OR_FAIL(f, &cpu->core_id, sizeof(cpu->core_id), "CORE_ID");
+    WRITE_OR_FAIL(f, &cpu->intenable, sizeof(cpu->intenable), "INTENABLE");
+    WRITE_OR_FAIL(f, &cpu->interrupt, sizeof(cpu->interrupt), "INTERRUPT");
+    WRITE_OR_FAIL(f, &cpu->cpenable, sizeof(cpu->cpenable), "CPENABLE");
+
+    /* Boolean and MAC16 state */
+    WRITE_OR_FAIL(f, &cpu->br, sizeof(cpu->br), "BR");
+    WRITE_OR_FAIL(f, &cpu->acclo, sizeof(cpu->acclo), "ACCLO");
+    WRITE_OR_FAIL(f, &cpu->acchi, sizeof(cpu->acchi), "ACCHI");
+    WRITE_OR_FAIL(f, cpu->mr, sizeof(cpu->mr), "MR");
+
+    /* User-register and floating-point state */
+    WRITE_OR_FAIL(f, &cpu->expstate, sizeof(cpu->expstate), "EXPSTATE");
+    WRITE_OR_FAIL(f, &cpu->threadptr, sizeof(cpu->threadptr), "THREADPTR");
+    WRITE_OR_FAIL(f, &cpu->fcr, sizeof(cpu->fcr), "FCR");
+    WRITE_OR_FAIL(f, &cpu->fsr, sizeof(cpu->fsr), "FSR");
+    WRITE_OR_FAIL(f, &cpu->f64r_lo, sizeof(cpu->f64r_lo), "F64R_LO");
+    WRITE_OR_FAIL(f, &cpu->f64r_hi, sizeof(cpu->f64r_hi), "F64R_HI");
+    WRITE_OR_FAIL(f, &cpu->f64s, sizeof(cpu->f64s), "F64S");
+    WRITE_OR_FAIL(f, cpu->fr, sizeof(cpu->fr), "FR");
+
+    /* Interrupt configuration */
+    WRITE_OR_FAIL(f, cpu->int_level, sizeof(cpu->int_level), "INT_LEVEL");
+
+    /* Window spill state */
+    WRITE_OR_FAIL(f, cpu->spill_stack, sizeof(cpu->spill_stack), "SPILL_STACK");
+    WRITE_OR_FAIL(f, cpu->spill_base, sizeof(cpu->spill_base), "SPILL_BASE");
+    WRITE_OR_FAIL(f, cpu->spill_shadow, sizeof(cpu->spill_shadow), "SPILL_SHADOW");
+    WRITE_OR_FAIL(f, &cpu->spill_verify, sizeof(cpu->spill_verify), "SPILL_VERIFY");
+
+    /* Execution state */
+    WRITE_OR_FAIL(f, &cpu->running, sizeof(cpu->running), "RUNNING");
+    WRITE_OR_FAIL(f, &cpu->exception, sizeof(cpu->exception), "EXCEPTION");
+    WRITE_OR_FAIL(f, &cpu->debug_break, sizeof(cpu->debug_break), "DEBUG_BREAK");
+    WRITE_OR_FAIL(f, &cpu->halted, sizeof(cpu->halted), "HALTED");
+    WRITE_OR_FAIL(f, &cpu->cycle_count, sizeof(cpu->cycle_count), "CYCLE_COUNT");
+    WRITE_OR_FAIL(f, &cpu->insn_count, sizeof(cpu->insn_count), "INSN_COUNT");
+    WRITE_OR_FAIL(f, &cpu->virtual_time_us, sizeof(cpu->virtual_time_us), "VIRTUAL_TIME_US");
+
+    /* === Memory Regions === */
+    static const char *const backing_name[FLEXE_MEM_BACKING_COUNT] = {
+        "SRAM", "ROM", "FLASH_DATA", "FLASH_INSN",
+        "RTC_FAST", "RTC_SLOW", "PSRAM",
+    };
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++) {
+        uint32_t size = hdr.backing_size[i];
+        uint8_t *ptr = mem_backing_ptr(cpu->mem, (flexe_mem_backing_t)i);
+        if (size != 0 && !ptr) {
+            fprintf(stderr, "savestate_save: %s is NULL\n", backing_name[i]);
+            fclose(f);
+            return -1;
+        }
+        if (size != 0)
+            WRITE_OR_FAIL(f, ptr, size, backing_name[i]);
+    }
+
+    /* === FreeRTOS State === */
+    if (frt) {
+        /* Marker to indicate FreeRTOS data follows */
+        uint32_t freertos_marker = 0xFEEDC0DE;
+        WRITE_OR_FAIL(f, &freertos_marker, sizeof(freertos_marker), "FREERTOS_MARKER");
+
+        /* Save FreeRTOS state */
+        if (freertos_stubs_save_state(frt, f) != 0) {
+            fprintf(stderr, "savestate_save: failed to save FreeRTOS state\n");
+            fclose(f);
+            return -1;
+        }
+    } else {
+        /* No FreeRTOS - write null marker */
+        uint32_t null_marker = 0;
+        WRITE_OR_FAIL(f, &null_marker, sizeof(null_marker), "NULL_FREERTOS_MARKER");
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/*
+ * Restore emulator state from checkpoint file.
+ */
+int savestate_restore(xtensa_cpu_t *cpu, freertos_stubs_t *frt, const char *path) {
+    if (!cpu || !cpu->mem || !mem_target(cpu->mem) || !path) {
+        fprintf(stderr, "savestate_restore: null argument\n");
+        return -1;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "savestate_restore: failed to open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    /* Read and validate header */
+    savestate_header_t hdr;
+    READ_OR_FAIL(f, &hdr, sizeof(hdr), "header");
+
+    if (hdr.magic != SAVESTATE_MAGIC) {
+        fprintf(stderr, "savestate_restore: invalid magic number (expected 0x%X, got 0x%X)\n",
+                SAVESTATE_MAGIC, hdr.magic);
+        fclose(f);
+        return -1;
+    }
+
+    if (hdr.version != SAVESTATE_VERSION) {
+        fprintf(stderr, "savestate_restore: version mismatch (expected %u, got %u)\n",
+                SAVESTATE_VERSION, hdr.version);
+        fclose(f);
+        return -1;
+    }
+
+    if (hdr.target_id != (uint32_t)mem_target(cpu->mem)->id) {
+        fprintf(stderr,
+                "savestate_restore: target mismatch (state=%u, emulator=%u)\n",
+                hdr.target_id, (unsigned)mem_target(cpu->mem)->id);
+        fclose(f);
+        return -1;
+    }
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++) {
+        uint32_t expected =
+            mem_backing_size(cpu->mem, (flexe_mem_backing_t)i);
+        if (hdr.backing_size[i] != expected) {
+            fprintf(stderr,
+                    "savestate_restore: backing %u size mismatch "
+                    "(state=%u, emulator=%u)\n",
+                    i, hdr.backing_size[i], expected);
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fprintf(stderr, "Restoring checkpoint: %s\n", hdr.description);
+    fprintf(stderr, "  Saved at:     %llu (Unix timestamp)\n", (unsigned long long)hdr.timestamp);
+    fprintf(stderr, "  Cycle count:  %llu\n", (unsigned long long)hdr.cycle_count);
+    fprintf(stderr, "  Insns:        %llu retired\n",
+            (unsigned long long)hdr.insn_count);
+
+    /* === Restore CPU State === */
+    READ_OR_FAIL(f, cpu->ar, sizeof(cpu->ar), "AR registers");
+    READ_OR_FAIL(f, &cpu->pc, sizeof(cpu->pc), "PC");
+    READ_OR_FAIL(f, &cpu->sar, sizeof(cpu->sar), "SAR");
+    READ_OR_FAIL(f, &cpu->lbeg, sizeof(cpu->lbeg), "LBEG");
+    READ_OR_FAIL(f, &cpu->lend, sizeof(cpu->lend), "LEND");
+    READ_OR_FAIL(f, &cpu->lcount, sizeof(cpu->lcount), "LCOUNT");
+    READ_OR_FAIL(f, &cpu->windowbase, sizeof(cpu->windowbase), "WINDOWBASE");
+    READ_OR_FAIL(f, &cpu->windowstart, sizeof(cpu->windowstart), "WINDOWSTART");
+    READ_OR_FAIL(f, &cpu->ps, sizeof(cpu->ps), "PS");
+    READ_OR_FAIL(f, &cpu->vecbase, sizeof(cpu->vecbase), "VECBASE");
+    READ_OR_FAIL(f, &cpu->exccause, sizeof(cpu->exccause), "EXCCAUSE");
+    READ_OR_FAIL(f, &cpu->excvaddr, sizeof(cpu->excvaddr), "EXCVADDR");
+    READ_OR_FAIL(f, cpu->epc, sizeof(cpu->epc), "EPC");
+    READ_OR_FAIL(f, cpu->eps, sizeof(cpu->eps), "EPS");
+    READ_OR_FAIL(f, cpu->excsave, sizeof(cpu->excsave), "EXCSAVE");
+    READ_OR_FAIL(f, &cpu->depc, sizeof(cpu->depc), "DEPC");
+    READ_OR_FAIL(f, &cpu->ccount, sizeof(cpu->ccount), "CCOUNT");
+    READ_OR_FAIL(f, cpu->ccompare, sizeof(cpu->ccompare), "CCOMPARE");
+    READ_OR_FAIL(f, &cpu->next_timer_event, sizeof(cpu->next_timer_event), "NEXT_TIMER_EVENT");
+    READ_OR_FAIL(f, &cpu->scompare1, sizeof(cpu->scompare1), "SCOMPARE1");
+    READ_OR_FAIL(f, cpu->misc, sizeof(cpu->misc), "MISC");
+    READ_OR_FAIL(f, &cpu->litbase, sizeof(cpu->litbase), "LITBASE");
+    READ_OR_FAIL(f, &cpu->atomctl, sizeof(cpu->atomctl), "ATOMCTL");
+    READ_OR_FAIL(f, &cpu->memctl, sizeof(cpu->memctl), "MEMCTL");
+    READ_OR_FAIL(f, &cpu->icount, sizeof(cpu->icount), "ICOUNT");
+    READ_OR_FAIL(f, &cpu->icountlevel, sizeof(cpu->icountlevel), "ICOUNTLEVEL");
+    READ_OR_FAIL(f, &cpu->debugcause, sizeof(cpu->debugcause), "DEBUGCAUSE");
+    READ_OR_FAIL(f, &cpu->ibreakenable, sizeof(cpu->ibreakenable), "IBREAKENABLE");
+    READ_OR_FAIL(f, cpu->ibreaka, sizeof(cpu->ibreaka), "IBREAKA");
+    READ_OR_FAIL(f, cpu->dbreaka, sizeof(cpu->dbreaka), "DBREAKA");
+    READ_OR_FAIL(f, cpu->dbreakc, sizeof(cpu->dbreakc), "DBREAKC");
+    READ_OR_FAIL(f, &cpu->configid0, sizeof(cpu->configid0), "CONFIGID0");
+    READ_OR_FAIL(f, &cpu->configid1, sizeof(cpu->configid1), "CONFIGID1");
+    READ_OR_FAIL(f, &cpu->prid, sizeof(cpu->prid), "PRID");
+    READ_OR_FAIL(f, &cpu->core_id, sizeof(cpu->core_id), "CORE_ID");
+    READ_OR_FAIL(f, &cpu->intenable, sizeof(cpu->intenable), "INTENABLE");
+    READ_OR_FAIL(f, &cpu->interrupt, sizeof(cpu->interrupt), "INTERRUPT");
+    READ_OR_FAIL(f, &cpu->cpenable, sizeof(cpu->cpenable), "CPENABLE");
+
+    READ_OR_FAIL(f, &cpu->br, sizeof(cpu->br), "BR");
+    READ_OR_FAIL(f, &cpu->acclo, sizeof(cpu->acclo), "ACCLO");
+    READ_OR_FAIL(f, &cpu->acchi, sizeof(cpu->acchi), "ACCHI");
+    READ_OR_FAIL(f, cpu->mr, sizeof(cpu->mr), "MR");
+
+    READ_OR_FAIL(f, &cpu->expstate, sizeof(cpu->expstate), "EXPSTATE");
+    READ_OR_FAIL(f, &cpu->threadptr, sizeof(cpu->threadptr), "THREADPTR");
+    READ_OR_FAIL(f, &cpu->fcr, sizeof(cpu->fcr), "FCR");
+    READ_OR_FAIL(f, &cpu->fsr, sizeof(cpu->fsr), "FSR");
+    READ_OR_FAIL(f, &cpu->f64r_lo, sizeof(cpu->f64r_lo), "F64R_LO");
+    READ_OR_FAIL(f, &cpu->f64r_hi, sizeof(cpu->f64r_hi), "F64R_HI");
+    READ_OR_FAIL(f, &cpu->f64s, sizeof(cpu->f64s), "F64S");
+    READ_OR_FAIL(f, cpu->fr, sizeof(cpu->fr), "FR");
+
+    READ_OR_FAIL(f, cpu->int_level, sizeof(cpu->int_level), "INT_LEVEL");
+
+    READ_OR_FAIL(f, cpu->spill_stack, sizeof(cpu->spill_stack), "SPILL_STACK");
+    READ_OR_FAIL(f, cpu->spill_base, sizeof(cpu->spill_base), "SPILL_BASE");
+    READ_OR_FAIL(f, cpu->spill_shadow, sizeof(cpu->spill_shadow), "SPILL_SHADOW");
+    READ_OR_FAIL(f, &cpu->spill_verify, sizeof(cpu->spill_verify), "SPILL_VERIFY");
+
+    READ_OR_FAIL(f, &cpu->running, sizeof(cpu->running), "RUNNING");
+    READ_OR_FAIL(f, &cpu->exception, sizeof(cpu->exception), "EXCEPTION");
+    READ_OR_FAIL(f, &cpu->debug_break, sizeof(cpu->debug_break), "DEBUG_BREAK");
+    READ_OR_FAIL(f, &cpu->halted, sizeof(cpu->halted), "HALTED");
+    READ_OR_FAIL(f, &cpu->cycle_count, sizeof(cpu->cycle_count), "CYCLE_COUNT");
+    READ_OR_FAIL(f, &cpu->insn_count, sizeof(cpu->insn_count), "INSN_COUNT");
+    READ_OR_FAIL(f, &cpu->virtual_time_us, sizeof(cpu->virtual_time_us), "VIRTUAL_TIME_US");
+
+    /* === Restore Memory Regions === */
+    static const char *const backing_name[FLEXE_MEM_BACKING_COUNT] = {
+        "SRAM", "ROM", "FLASH_DATA", "FLASH_INSN",
+        "RTC_FAST", "RTC_SLOW", "PSRAM",
+    };
+    for (unsigned i = 0; i < FLEXE_MEM_BACKING_COUNT; i++) {
+        uint32_t size = hdr.backing_size[i];
+        uint8_t *ptr = mem_backing_ptr(cpu->mem, (flexe_mem_backing_t)i);
+        if (size != 0 && !ptr) {
+            fprintf(stderr, "savestate_restore: %s is NULL\n",
+                    backing_name[i]);
+            fclose(f);
+            return -1;
+        }
+        if (size != 0)
+            READ_OR_FAIL(f, ptr, size, backing_name[i]);
+    }
+
+    /* === Restore FreeRTOS State === */
+    uint32_t freertos_marker;
+    READ_OR_FAIL(f, &freertos_marker, sizeof(freertos_marker), "FREERTOS_MARKER");
+
+    if (freertos_marker == 0xFEEDC0DE) {
+        /* FreeRTOS state present */
+        if (!frt) {
+            fprintf(stderr, "savestate_restore: checkpoint has FreeRTOS state but no frt provided\n");
+            fclose(f);
+            return -1;
+        }
+
+        if (freertos_stubs_restore_state(frt, f) != 0) {
+            fprintf(stderr, "savestate_restore: failed to restore FreeRTOS state\n");
+            fclose(f);
+            return -1;
+        }
+    } else if (freertos_marker == 0) {
+        /* No FreeRTOS state in checkpoint */
+        if (frt) {
+            fprintf(stderr, "savestate_restore: warning - checkpoint has no FreeRTOS state but frt provided\n");
+        }
+    } else {
+        fprintf(stderr, "savestate_restore: invalid FreeRTOS marker (expected 0xFEEDC0DE or 0, got 0x%X)\n",
+                freertos_marker);
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    fprintf(stderr, "Checkpoint restored successfully\n");
+    return 0;
+}
+
+/*
+ * List available checkpoints in directory.
+ * (Placeholder implementation - just returns empty list for now)
+ */
+int savestate_list(const char *dir, char ***out_paths, int *out_count) {
+    (void)dir;
+    if (out_paths) *out_paths = NULL;
+    if (out_count) *out_count = 0;
+    /* TODO: Implement directory scanning for .sav files */
+    return 0;
+}

@@ -1,0 +1,3672 @@
+#include "freertos_stubs.h"
+#include "target.h"
+#include "rom_stubs.h"
+#include "memory.h"
+#include "guest_call.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <pthread.h>
+
+/* Bump allocator region in high SRAM */
+#define BUMP_BASE   0x3FFF0000u
+#define BUMP_LIMIT  0x3FFF4000u  /* 16KB */
+
+/* FreeRTOS constants */
+#define pdTRUE   1
+#define pdFALSE  0
+#define pdPASS   1
+
+#define ESP32_CPU_TICKS_PER_US_ADDR 0x3FFE01E0u
+#define FLEXE_FREERTOS_HZ           1000u
+
+/* Event group storage. Like the software timers, these cannot be left to the
+ * guest's own implementation: it blocks waiters by threading them onto
+ * FreeRTOS's unordered event lists, which Flexe's scheduler does not read, so
+ * every blocking wait hangs forever. The non-blocking half (set, clear, get)
+ * works either way, which is what makes the breakage easy to miss. */
+#define MAX_EVENT_GROUPS 16
+
+/* Software timer storage. FreeRTOS's own timer module cannot be used here:
+ * its daemon blocks on the command queue through vQueueWaitForMessageRestricted,
+ * which reaches into the real queue structure, while every queue API the guest
+ * calls is hooked to Flexe's queue objects. The daemon would wait forever on an
+ * always-empty queue. Model the timers directly instead, as tasks, queues and
+ * semaphores already are. */
+#define MAX_SW_TIMERS    32
+
+/* Command IDs from FreeRTOS timers.h. xTimerStart(), xTimerStop() and the
+ * rest are macros over xTimerGenericCommand(), so hooking that one entry
+ * point covers the whole API. */
+#define tmrCOMMAND_EXECUTE_CALLBACK_FROM_ISR (-2)
+#define tmrCOMMAND_EXECUTE_CALLBACK          (-1)
+#define tmrCOMMAND_START_DONT_TRACE          0
+#define tmrCOMMAND_START                     1
+#define tmrCOMMAND_RESET                     2
+#define tmrCOMMAND_STOP                      3
+#define tmrCOMMAND_CHANGE_PERIOD             4
+#define tmrCOMMAND_DELETE                    5
+#define tmrCOMMAND_START_FROM_ISR            6
+#define tmrCOMMAND_RESET_FROM_ISR            7
+#define tmrCOMMAND_STOP_FROM_ISR             8
+#define tmrCOMMAND_CHANGE_PERIOD_FROM_ISR    9
+
+/* Instruction budget for one software-timer callback. */
+#define SW_TIMER_CALLBACK_INSNS 100000u
+
+/* Queue storage */
+#define MAX_QUEUES       64
+#define MAX_QUEUE_ITEMS  32
+#define MAX_ITEM_SIZE    64
+
+/* ESP-IDF ring buffers sit above FreeRTOS queues but retain their own data
+ * store and item boundaries. Letting their native implementation run against
+ * Flexe's host-backed queue handles mixes two incompatible object models;
+ * keep the container state here and its payload in guest-visible heap RAM. */
+#define MAX_RINGBUFFERS       16
+#define MAX_RINGBUFFER_ITEMS 256
+#define RINGBUF_TYPE_NOSPLIT   0u
+#define RINGBUF_TYPE_ALLOWSPLIT 1u
+#define RINGBUF_TYPE_BYTEBUF   2u
+
+typedef struct {
+    uint32_t handle;       /* address returned as handle */
+    uint32_t static_storage; /* caller-owned item storage, when static */
+    int      item_size;
+    int      max_items;
+    int      count;
+    int      head;
+    int      tail;
+    uint8_t  buf[MAX_QUEUE_ITEMS * MAX_ITEM_SIZE];
+    /* Mutex bookkeeping. A recursive mutex is re-entrant for the task that
+     * already holds it, so the owner and depth have to be tracked; a plain
+     * semaphore has neither. */
+    bool     is_mutex;
+    bool     is_static;
+    uint32_t mutex_owner;    /* task handle, 0 when free */
+    int      mutex_depth;
+} queue_t;
+
+typedef struct {
+    uint32_t handle;
+    uint32_t storage;
+    uint32_t static_control;
+    uint32_t capacity;
+    uint32_t used;
+    uint32_t borrowed_len;
+    uint32_t acquired_len;
+    uint32_t item_len[MAX_RINGBUFFER_ITEMS];
+    unsigned item_count;
+    uint8_t type;
+    bool borrowed;
+    bool acquired;
+    bool owns_storage;
+} ringbuffer_t;
+
+typedef struct {
+    uint32_t handle;         /* address returned as the EventGroupHandle_t */
+    uint32_t bits;
+    bool     used;
+} event_group_t;
+
+typedef struct {
+    uint32_t handle;         /* address returned as the TimerHandle_t */
+    uint32_t callback_addr;
+    uint32_t id;             /* pvTimerGetTimerID / vTimerSetTimerID */
+    uint32_t name_addr;      /* guest pointer, returned by pcTimerGetName */
+    uint32_t period_ticks;
+    bool     autoreload;
+    bool     active;
+    bool     used;
+    uint64_t alarm_us;       /* absolute guest time */
+} sw_timer_t;
+
+/* ===== Cooperative scheduler types ===== */
+
+typedef enum {
+    TASK_UNUSED = 0,
+    TASK_READY,
+    TASK_RUNNING,
+    TASK_SLEEPING,
+    TASK_BLOCKED_QUEUE,
+    TASK_BLOCKED_NOTIFY,
+    TASK_BLOCKED_EVENTGROUP,
+    TASK_SUSPENDED
+} task_state_t;
+
+#define FRT_NOTIFY_SLOTS 4u
+
+#define MAX_TASKS        16
+#define TASK_STACK_SIZE  0x4000u      /* 16KB per task */
+#define TASK_STACK_BASE  0x3FB00000u  /* PSRAM, 3MB offset from 0x3F800000 */
+
+typedef struct {
+    uint32_t     handle;
+    uint32_t     entry_fn;
+    uint32_t     param;
+    uint8_t      priority;
+    int          core_affinity;   /* -1 = no affinity, 0 or 1 = pinned */
+    task_state_t state;
+    char         name[16];
+    uint64_t     wake_cycle;     /* cycle_count threshold for SLEEPING */
+    bool         is_idle;        /* per-core WAITI task, never real work */
+    /* Physical ar[] index the blocked call's return value belongs in. The
+     * caller's slot depends on PS.CALLINC at the call, so it cannot be
+     * recomputed after frt_return() has zeroed it. */
+    uint8_t      ret_ar_slot;
+    uint32_t     blocked_queue;  /* queue/semaphore handle being waited on */
+    /* A blocked receive or take. q_waiting is matched instead of the task
+     * state, because a finite timeout parks the task in TASK_SLEEPING so its
+     * deadline is honoured and it must still be wakeable by a send. */
+    uint32_t     q_recv_buf;     /* destination for the item; 0 for a semaphore */
+    bool         q_waiting;
+    bool         q_is_semaphore;
+    bool         q_peek;         /* xQueuePeek: copy the item, leave it queued */
+    bool         q_is_sender;    /* blocked in a send on a full queue */
+    uint8_t      q_copy_pos;     /* copy position the blocked send asked for */
+    uint32_t     rb_handle;      /* ring buffer awaited by pointer-return API */
+    uint32_t     rb_size_out;    /* guest size_t* written when data arrives */
+    uint32_t     rb_max_size;    /* ReceiveUpTo limit, UINT32_MAX otherwise */
+    bool         rb_waiting;
+    /* Event group wait, mirroring the notification fields below: eg_waiting
+     * stays true across both the indefinite and the timed block, so a setter
+     * can wake the task whichever state it is parked in. */
+    uint32_t     eg_handle;
+    uint32_t     eg_bits;        /* bits waited for */
+    bool         eg_waiting;
+    bool         eg_clear_on_exit;
+    bool         eg_wait_all;
+    uint32_t     notify_value[FRT_NOTIFY_SLOTS];
+    uint8_t      notify_wait_index;
+    bool         notify_waiting;
+    bool         notify_clear_on_exit;
+    /* Saved CPU context */
+    uint32_t     ar[64];
+    uint32_t     pc, ps;
+    uint32_t     windowbase, windowstart;
+    uint32_t     spill_base[16];
+    /* Keep these opaque copies tied to xtensa_cpu_t's exact dimensions.
+     * The CPU spill depth grew from 8 to 32; mirroring the old dimensions
+     * here made sched_save_context() overwrite the following task's TCB. */
+    uint8_t      spill_stack[sizeof(((xtensa_cpu_t *)0)->spill_stack)];
+    uint8_t      spill_shadow[sizeof(((xtensa_cpu_t *)0)->spill_shadow)];
+    uint8_t      window_callsize[sizeof(((xtensa_cpu_t *)0)->window_callsize)];
+    uint32_t     sar, lbeg, lend, lcount;
+    uint32_t     expstate, threadptr, fcr, fsr;
+    uint32_t     f64r_lo, f64r_hi, f64s;
+    float        fr[16];
+    uint32_t     stack_top;
+    /* Run-time accounting for uxTaskGetSystemState. Cumulative cycles
+     * spent in TASK_RUNNING on any core, updated at every sched_save_context. */
+    uint64_t     cumulative_cycles;
+} task_tcb_t;
+
+struct freertos_stubs {
+    xtensa_cpu_t       *cpu[2];     /* Per-core CPU pointers */
+    esp32_rom_stubs_t  *rom;        /* for registering hooks */
+
+    /* Bump allocator */
+    uint32_t bump_ptr;
+
+    /* Arduino-ESP32 / ESP-IDF production builds use a 1 kHz RTOS tick. */
+    uint32_t cycles_per_tick;
+    uint32_t cpu_freq_mhz;
+
+    /* Queue storage */
+    queue_t  queues[MAX_QUEUES];
+    int      queue_count;
+
+    ringbuffer_t ringbuffers[MAX_RINGBUFFERS];
+    int          ringbuffer_count;
+
+    /* Software timer storage */
+    sw_timer_t sw_timers[MAX_SW_TIMERS];
+    int        sw_timer_count;
+
+    /* Event group storage */
+    event_group_t event_groups[MAX_EVENT_GROUPS];
+    int           event_group_count;
+
+    /* Deferred task: saved by xTaskCreatePinnedToCore for later execution */
+    uint32_t deferred_task_fn;
+    uint32_t deferred_task_param;
+
+    /* Cooperative scheduler */
+    task_tcb_t tasks[MAX_TASKS];
+    int        task_count;
+    int        current_task[2];       /* Per-core current task (-1 during boot) */
+    bool       scheduler_started;
+    uint32_t   core_startup_done_addr; /* port_uxCoreStartupDone[] */
+    uint64_t   last_switch_cycle[2];  /* Per-core cycle at last context switch */
+    /* Cycles spent with no runnable task, fast-forwarded through by
+     * sched_pick_next during deep sleeps. Keeps uxTaskGetSystemState's
+     * total_run_time monotonically advancing even when every task slept. */
+    uint64_t   idle_cycles;
+    int        idle_task[2];   /* per-core WAITI task index */
+    bool       idle_ready;
+
+    /* Thread safety */
+    pthread_mutex_t lock;
+
+    /* Event callback for task switches */
+    freertos_event_fn event_fn;
+    void             *event_ctx;
+};
+
+static void stub_deferred_task_trampoline(xtensa_cpu_t *cpu, void *ctx);
+
+static void frt_refresh_cpu_frequency(freertos_stubs_t *frt,
+                                      xtensa_cpu_t *cpu) {
+    uint32_t mhz = mem_read32(cpu->mem, ESP32_CPU_TICKS_PER_US_ADDR);
+    if (mhz >= 10u && mhz <= 240u && mhz != frt->cpu_freq_mhz) {
+        frt->cpu_freq_mhz = mhz;
+        frt->cycles_per_tick = mhz * (1000000u / FLEXE_FREERTOS_HZ);
+    }
+}
+
+/* ===== Calling convention helpers (same as rom_stubs.c) ===== */
+
+static uint32_t frt_arg(xtensa_cpu_t *cpu, int n) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    /* The Xtensa windowed ABI provides six argument registers.  Calls with
+     * more arguments place arg 6 onward at the caller's stack pointer.  The
+     * PC hook runs before the callee's ENTRY instruction, so a1 still names
+     * that caller stack. */
+    if (n < 6)
+        return ar_read(cpu, ci * 4 + 2 + n);
+    return mem_read32(cpu->mem, ar_read(cpu, 1) + (uint32_t)(n - 6) * 4u);
+}
+
+/* Physical ar[] index frt_return() would write for the current call frame.
+ * A task that blocks inside a CALL4/8/12 returns into the caller's
+ * a(4*CALLINC+2), not a2; patching a2 instead silently overwrites the
+ * callee's first argument. */
+static uint8_t frt_return_slot(const xtensa_cpu_t *cpu) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    unsigned n = ci > 0 ? (unsigned)(ci * 4 + 2) : 2u;
+    return (uint8_t)((cpu->windowbase * 4u + n) & 63u);
+}
+
+static void frt_return(xtensa_cpu_t *cpu, uint32_t retval) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    if (ci > 0) {
+        ar_write(cpu, ci * 4 + 2, retval);
+        uint32_t a0 = ar_read(cpu, ci * 4);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+        XT_PS_SET_CALLINC(cpu->ps, 0);
+    } else {
+        ar_write(cpu, 2, retval);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
+    }
+}
+
+static void frt_return_void(xtensa_cpu_t *cpu) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    if (ci > 0) {
+        uint32_t a0 = ar_read(cpu, ci * 4);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+        XT_PS_SET_CALLINC(cpu->ps, 0);
+    } else {
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
+    }
+}
+
+
+/* Convert FreeRTOS ticks to cycles against the *current* CPU frequency.
+ *
+ * Reading the cached cycles_per_tick without refreshing first is a real
+ * hazard rather than a tidiness point: it starts at the 160 MHz default and
+ * is only updated when some other stub happens to refresh it, so a timeout
+ * computed before that -- which for a firmware whose first blocking call is a
+ * queue, notification or event-group wait is the very first one -- comes out
+ * a third short at 240 MHz. Measured: a 120 ms wait that expired after 80 ms.
+ */
+static uint64_t frt_ticks_to_cycles(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
+                                    uint32_t ticks) {
+    frt_refresh_cpu_frequency(frt, cpu);
+    return (uint64_t)ticks * frt->cycles_per_tick;
+}
+
+/* ===== Bump allocator ===== */
+
+static uint32_t bump_alloc(freertos_stubs_t *frt, uint32_t size) {
+    /* Align to 4 bytes */
+    size = (size + 3) & ~3u;
+    if (frt->bump_ptr + size > BUMP_LIMIT)
+        return 0;
+    uint32_t ptr = frt->bump_ptr;
+    frt->bump_ptr += size;
+    return ptr;
+}
+
+/* ===== Cooperative scheduler core ===== */
+
+static void sched_save_context(freertos_stubs_t *frt, int core_id) {
+    /* A synthetic guest call (guest_call8, used to deliver peripheral ISRs
+     * and BT/Wi-Fi callbacks) runs on a fabricated register file. Writing
+     * that into the current task's TCB would destroy the task. */
+    if (frt->cpu[core_id] && frt->cpu[core_id]->in_guest_call) {
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[flexe] refused task context save inside a "
+                            "synthetic guest call (core %d)\n", core_id);
+        }
+        return;
+    }
+    xtensa_cpu_t *cpu = frt->cpu[core_id];
+    int tidx = frt->current_task[core_id];
+    task_tcb_t *t = &frt->tasks[tidx];
+    /* Accumulate time this task spent running since its last switch-in. */
+    if (cpu->cycle_count >= frt->last_switch_cycle[core_id])
+        t->cumulative_cycles += cpu->cycle_count - frt->last_switch_cycle[core_id];
+    /* Trap: detect saving a corrupted PC */
+    if (cpu->pc < ESP32_INSN_ADDR_LOW || cpu->pc >= ESP32_INSN_ADDR_HIGH) {
+        fprintf(stderr, "[SAVE-TRAP] Saving task %d '%s' with bad PC=0x%08X on core %d (cycle %llu)\n",
+                tidx, t->name, cpu->pc, core_id,
+                (unsigned long long)cpu->cycle_count);
+    }
+    memcpy(t->ar, cpu->ar, sizeof(cpu->ar));
+    t->pc = cpu->pc;
+    t->ps = cpu->ps;
+    t->windowbase = cpu->windowbase;
+    t->windowstart = cpu->windowstart;
+    memcpy(t->spill_base, cpu->spill_base, sizeof(cpu->spill_base));
+    memcpy(t->spill_stack, cpu->spill_stack, sizeof(cpu->spill_stack));
+    memcpy(t->spill_shadow, cpu->spill_shadow, sizeof(cpu->spill_shadow));
+    memcpy(t->window_callsize, cpu->window_callsize,
+           sizeof(cpu->window_callsize));
+    t->sar = cpu->sar;
+    t->lbeg = cpu->lbeg;
+    t->lend = cpu->lend;
+    t->lcount = cpu->lcount;
+    t->expstate = cpu->expstate;
+    t->threadptr = cpu->threadptr;
+    t->fcr = cpu->fcr;
+    t->fsr = cpu->fsr;
+    t->f64r_lo = cpu->f64r_lo;
+    t->f64r_hi = cpu->f64r_hi;
+    t->f64s = cpu->f64s;
+    memcpy(t->fr, cpu->fr, sizeof(cpu->fr));
+}
+
+static void sched_restore_context(freertos_stubs_t *frt, int core_id) {
+    xtensa_cpu_t *cpu = frt->cpu[core_id];
+    int tidx = frt->current_task[core_id];
+    task_tcb_t *t = &frt->tasks[tidx];
+    /* Trap: detect task with corrupted saved PC */
+    if (t->pc < ESP32_INSN_ADDR_LOW || t->pc >= ESP32_INSN_ADDR_HIGH) {
+        fprintf(stderr, "[SCHED-TRAP] Restoring task %d '%s' with bad PC=0x%08X on core %d (cycle %llu)\n",
+                tidx, t->name, t->pc, core_id,
+                (unsigned long long)cpu->cycle_count);
+        fprintf(stderr, "  task WB=%u WS=0x%X PS=0x%08X\n",
+                t->windowbase, t->windowstart, t->ps);
+        fprintf(stderr, "  task ar[0..7]: %08X %08X %08X %08X  %08X %08X %08X %08X\n",
+                t->ar[0], t->ar[1], t->ar[2], t->ar[3],
+                t->ar[4], t->ar[5], t->ar[6], t->ar[7]);
+    }
+    memcpy(cpu->ar, t->ar, sizeof(cpu->ar));
+    cpu->pc = t->pc;
+    cpu->ps = t->ps;
+    cpu->windowbase = t->windowbase;
+    cpu->windowstart = t->windowstart;
+    memcpy(cpu->spill_base, t->spill_base, sizeof(cpu->spill_base));
+    memcpy(cpu->spill_stack, t->spill_stack, sizeof(cpu->spill_stack));
+    memcpy(cpu->spill_shadow, t->spill_shadow, sizeof(cpu->spill_shadow));
+    memcpy(cpu->window_callsize, t->window_callsize,
+           sizeof(cpu->window_callsize));
+    cpu->sar = t->sar;
+    cpu->lbeg = t->lbeg;
+    cpu->lend = t->lend;
+    cpu->lcount = t->lcount;
+    cpu->expstate = t->expstate;
+    cpu->threadptr = t->threadptr;
+    cpu->fcr = t->fcr;
+    cpu->fsr = t->fsr;
+    cpu->f64r_lo = t->f64r_lo;
+    cpu->f64r_hi = t->f64r_hi;
+    cpu->f64s = t->f64s;
+    memcpy(cpu->fr, t->fr, sizeof(cpu->fr));
+}
+
+static uint32_t eg_current_bits(freertos_stubs_t *frt, uint32_t handle);
+
+/* Wake any SLEEPING tasks whose wake_cycle has been reached.
+ * Returns the nearest wake time if all tasks are sleeping, or 0. */
+static uint64_t sched_wake_sleepers(freertos_stubs_t *frt, int core_id) {
+    uint64_t now = frt->cpu[core_id]->cycle_count;
+    uint64_t nearest = UINT64_MAX;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (t->state == TASK_SLEEPING) {
+            if (now >= t->wake_cycle) {
+                t->notify_waiting = false;
+                if (t->q_waiting) {
+                    /* The pre-set return value is already pdFALSE, which is
+                     * what a receive or take that ran out of time reports. */
+                    t->q_waiting = false;
+                    t->q_is_sender = false;
+                    t->blocked_queue = 0;
+                }
+                if (t->rb_waiting) {
+                    /* The saved return value is already NULL.  Stop a later
+                     * ISR send from reviving a receive whose deadline has
+                     * expired. */
+                    t->rb_waiting = false;
+                    t->rb_handle = 0u;
+                    t->rb_size_out = 0u;
+                    t->rb_max_size = 0u;
+                }
+                if (t->eg_waiting) {
+                    /* A timed-out xEventGroupWaitBits() returns the bits as
+                     * they stand at the timeout, not as they stood when the
+                     * wait began. */
+                    t->ar[t->ret_ar_slot] = eg_current_bits(frt, t->eg_handle);
+                    t->eg_waiting = false;
+                }
+                t->state = TASK_READY;
+            } else if (t->wake_cycle < nearest) {
+                nearest = t->wake_cycle;
+            }
+        }
+    }
+    return nearest;
+}
+
+/* Per-core idle task.
+ *
+ * Without one there is no context in which a core may sit while every real
+ * task is blocked. Parking the core with cpu->halted alone is not enough: an
+ * interrupt un-halts it and RFI returns straight into the *blocked* task's
+ * saved PC, so it resumes behind the scheduler's back. The idle task gives
+ * that interrupt somewhere legitimate to land — it executes WAITI, the ISR
+ * runs on its context, and RFI returns to the jump that loops back to WAITI.
+ *
+ * Six bytes of guest code placed in RTC-fast RAM through its instruction-bus
+ * alias at 0x400C0000, which is inside the address range the interpreter and
+ * the scheduler both accept as executable:  WAITI 0 ; J .-3. */
+#define IDLE_STUB_ADDR 0x400C1E00u  /* RTC-fast via its instruction alias */
+
+static int sched_register_task(freertos_stubs_t *frt, uint32_t fn,
+                               uint32_t param, uint8_t priority,
+                               uint32_t handle, int core_affinity);
+
+static void frt_install_idle_tasks(freertos_stubs_t *frt) {
+    if (frt->idle_ready || !frt->cpu[0] || !frt->cpu[0]->mem) return;
+    static const uint8_t stub[] = {
+        0x00, 0x70, 0x00,   /* WAITI 0            */
+        0x46, 0xFE, 0xFF,   /* J    IDLE_STUB_ADDR */
+    };
+    for (unsigned i = 0; i < sizeof(stub); i++)
+        mem_write8(frt->cpu[0]->mem, IDLE_STUB_ADDR + i, stub[i]);
+    /* The firmware-wide predecode/JIT caches are already populated by the
+     * time the scheduler first needs an idle context.  Without invalidating
+     * this generated range, both engines continue executing the zero-filled
+     * RTC RAM they cached at load time -- an ILL at the first WAITI. */
+    xtensa_invalidate_code(frt->cpu[0], IDLE_STUB_ADDR, sizeof(stub));
+    if (frt->cpu[1] && frt->cpu[1]->predecode != frt->cpu[0]->predecode)
+        xtensa_invalidate_code(frt->cpu[1], IDLE_STUB_ADDR, sizeof(stub));
+    for (int core = 0; core < 2; core++) {
+        int idx = sched_register_task(frt, IDLE_STUB_ADDR, 0u, 0u,
+                                      0x3FFF0100u + (uint32_t)core, core);
+        if (idx < 0) return;
+        snprintf(frt->tasks[idx].name, sizeof(frt->tasks[idx].name),
+                 "IDLE%d", core);
+        frt->tasks[idx].is_idle = true;
+        /* Keep the same user-mode bit as every other synthetic task context.
+         * Any unwind that reaches a0 must land somewhere sane rather than the
+         * generic dummy return address, so point it back at the stub,
+         * CALL8-encoded. */
+        frt->tasks[idx].ps = 0x00040020u;   /* WOE=1, user mode */
+        frt->tasks[idx].ar[0] =
+            (2u << 30) | (IDLE_STUB_ADDR & 0x3FFFFFFFu);
+        frt->idle_task[core] = idx;
+    }
+    frt->idle_ready = true;
+}
+
+/* Find the highest-priority READY task eligible for core_id,
+ * round-robin among equals.  Returns task index or -1. */
+static int sched_pick_next(freertos_stubs_t *frt, int core_id) {
+    (void)sched_wake_sleepers(frt, core_id);
+
+    /* Find highest priority among READY tasks eligible for this core. Idle
+     * tasks are excluded here and used only as the fallback below, so they
+     * can never win on a priority tie with real work. */
+    int best_prio = -1;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (t->state != TASK_READY || t->is_idle) continue;
+        if (t->core_affinity >= 0 && t->core_affinity != core_id) continue;
+        if (t->priority > best_prio)
+            best_prio = t->priority;
+    }
+
+    if (best_prio >= 0) {
+        /* Round-robin: start searching after current_task */
+        int cur = frt->current_task[core_id];
+        int start = (cur >= 0) ? (cur + 1) % frt->task_count : 0;
+        for (int j = 0; j < frt->task_count; j++) {
+            int i = (start + j) % frt->task_count;
+            task_tcb_t *t = &frt->tasks[i];
+            if (t->state == TASK_READY && !t->is_idle &&
+                t->priority == best_prio &&
+                (t->core_affinity < 0 || t->core_affinity == core_id))
+                return i;
+        }
+    }
+
+    /* Nothing real to run: fall back to this core's idle task, which sits in
+     * WAITI. Do NOT fast-forward here: this runs inside a stub,
+     * so a single xtensa_run() batch could span unbounded simulated time
+     * (10000 guest instructions can contain a thousand delay() calls, i.e.
+     * hundreds of millions of cycles), which starves every frontend that
+     * interleaves with the guest at batch granularity.
+     *
+     * Report "idle" instead. sched_switch() parks the core, and the halted
+     * path in xtensa_run() advances event-by-event, fires each timer at its
+     * own ccount, delivers pending interrupts, and — crucially — charges the
+     * cycles it skips against the caller's batch budget. */
+    /* Both ESP32 cores always own an idle task, even when application work is
+     * pinned entirely to the other core.  Leaving an otherwise-empty core
+     * parked at the tail of its startup function is unsafe: a synchronous
+     * peripheral/timer callback wakes WAITI semantics on completion, and the
+     * core then returns through a startup frame that is no longer live. */
+    frt_install_idle_tasks(frt);
+    if (frt->idle_ready) {
+        int idle = frt->idle_task[core_id];
+        frt->tasks[idle].state = TASK_READY;
+        return idle;
+    }
+    return -1;  /* all tasks blocked/unused/pinned elsewhere */
+}
+
+/* Context-switch on a specific core: save current, pick next, restore.
+ * With no runnable task, enter an interruptible idle state. Hardware clocks
+ * continue and xtensa_run_halted() fast-forwards to the next peripheral or
+ * timer event; stopping the CPU outright would deadlock ISR-backed waits. */
+static void sched_switch(freertos_stubs_t *frt, int core_id) {
+    /* Likewise, switching away would strand the in-flight synthetic call:
+     * its sentinel return would never be reached. */
+    if (frt->cpu[core_id] && frt->cpu[core_id]->in_guest_call)
+        return;
+    int prev = frt->current_task[core_id];
+    int next = sched_pick_next(frt, core_id);
+    if (next < 0) {
+        /* Idle: park the core. current_task is cleared so the preemption
+         * check adopts a task (and clears halted) as soon as one is ready;
+         * leaving it pointing at a blocked task strands the core. */
+        frt->current_task[core_id] = -1;
+        frt->cpu[core_id]->running = true;
+        frt->cpu[core_id]->halted = true;
+        return;
+    }
+    frt->current_task[core_id] = next;
+    frt->tasks[next].state = TASK_RUNNING;
+    frt->last_switch_cycle[core_id] = frt->cpu[core_id]->cycle_count;
+    sched_restore_context(frt, core_id);
+
+    /* Emit event callback on task change */
+    if (frt->event_fn && next != prev) {
+        const char *from = (prev >= 0) ? frt->tasks[prev].name : "boot";
+        const char *to = frt->tasks[next].name;
+        frt->event_fn(from, to, frt->cpu[core_id]->cycle_count, frt->event_ctx);
+    }
+}
+
+/* Read a C string from emulator memory into buf */
+static void frt_read_string(xtensa_cpu_t *cpu, uint32_t addr, char *buf, int max) {
+    for (int i = 0; i < max - 1; i++) {
+        uint8_t c = mem_read8(cpu->mem, addr + (uint32_t)i);
+        buf[i] = (char)c;
+        if (c == 0) return;
+    }
+    buf[max - 1] = '\0';
+}
+
+/* Register a new task in the scheduler TCB table.
+ * Returns the task index, or -1 if table is full. */
+static int sched_register_task(freertos_stubs_t *frt, uint32_t fn, uint32_t param,
+                               uint8_t priority, uint32_t handle, int core_affinity) {
+    if (frt->task_count >= MAX_TASKS) return -1;
+    int idx = frt->task_count++;
+    task_tcb_t *t = &frt->tasks[idx];
+    memset(t, 0, sizeof(*t));
+    t->handle = handle;
+    t->entry_fn = fn;
+    t->param = param;
+    t->priority = priority;
+    t->core_affinity = core_affinity;
+    t->state = TASK_READY;
+    /* Assign a stack in PSRAM */
+    t->stack_top = TASK_STACK_BASE + (uint32_t)(idx + 1) * TASK_STACK_SIZE;
+    /* Pre-initialize saved context for first switch-in.
+     * a0 must encode the call size in bits [31:30] so the window overflow
+     * handler saves enough registers: 0→4, 1→4, 2→8, 3→12.
+     * Use CALL8 encoding (bits 31:30 = 10) so a0-a7 are all preserved. */
+    t->pc = fn;
+    t->ps = 0x00040020u;  /* WOE=1, UM=1, CALLINC=0 */
+    t->windowbase = 0;
+    t->windowstart = 1;   /* window 0 valid */
+    /* a0 = dummy addr with CALL8 encoding so overflow spills 8 regs */
+    t->ar[0] = 0x80000000u;
+    /* a1 = SP (physical ar[1]), a2 = param (physical ar[2]) */
+    t->ar[1] = t->stack_top;
+    t->ar[2] = param;
+    return idx;
+}
+
+/* Publish the per-core state which ESP-IDF's real xPortStartScheduler writes
+ * immediately before entering task dispatch. The host scheduler replaces that
+ * port layer, so main_task must observe the equivalent transition. */
+static void sched_mark_cores_started(freertos_stubs_t *frt) {
+    if (!frt->core_startup_done_addr || !frt->cpu[0]) return;
+    for (int core = 0; core < 2; core++) {
+        if (frt->cpu[core])
+            mem_write32(frt->cpu[0]->mem,
+                        frt->core_startup_done_addr + (uint32_t)core * 4u,
+                        1u);
+    }
+}
+
+/* Start the scheduler: save boot context as implicit task 0 if needed,
+ * then pick the highest-priority task to run. */
+static void sched_start(freertos_stubs_t *frt) {
+    if (frt->scheduler_started) return;
+    frt->scheduler_started = true;
+    frt->current_task[0] = -1;
+    frt->current_task[1] = -1;
+    sched_mark_cores_started(frt);
+
+    /* Reset ccount so millis()/micros() start near zero when tasks begin.
+     * Boot-time ets_delay_us() calls inflate ccount to billions, which
+     * causes firmware division-by-subtraction loops on millis() to hang. */
+    frt->cpu[0]->ccount = 0;
+    frt->cpu[0]->cycle_count = 0;
+    frt->cpu[0]->insn_count = 0;
+
+    /* All registered tasks are READY; pick the first to run on core 0 */
+    int next = sched_pick_next(frt, 0);
+    if (next >= 0) {
+        frt->current_task[0] = next;
+        frt->tasks[next].state = TASK_RUNNING;
+        frt->last_switch_cycle[0] = frt->cpu[0]->cycle_count;
+        sched_restore_context(frt, 0);
+    }
+}
+
+/* Promote from legacy single-task mode to scheduler mode.
+ * Called when a new task is registered while already running in legacy mode.
+ * The currently-executing code becomes task 0 (already in the tasks array). */
+static void sched_promote_legacy(freertos_stubs_t *frt) {
+    if (frt->scheduler_started || frt->task_count < 2)
+        return;
+    frt->scheduler_started = true;
+    sched_mark_cores_started(frt);
+    /* The legacy task is tasks[0] — mark it as RUNNING and current on core 0 */
+    frt->current_task[0] = 0;
+    frt->tasks[0].state = TASK_RUNNING;
+    /* Save current CPU context into tasks[0] so context switches work */
+    sched_save_context(frt, 0);
+    frt->last_switch_cycle[0] = frt->cpu[0]->cycle_count;
+}
+
+/* ===== FreeRTOS stub implementations ===== */
+
+/* Block the running task for `advance` guest cycles. Returns true when the
+ * scheduler took ownership: the guest return has already been performed and
+ * a context switch made, so the caller must not write a return value. */
+static bool frt_block_cycles(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
+                             uint64_t advance) {
+    if (advance > 200000000ULL) advance = 200000000ULL;
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    if (frt->scheduler_started && frt->current_task[core_id] >= 0) {
+        /* Yield: unwind call, save, sleep, switch */
+        frt_return_void(cpu);
+        sched_save_context(frt, core_id);
+        task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+        t->state = TASK_SLEEPING;
+        t->wake_cycle = cpu->cycle_count + advance;
+        sched_switch(frt, core_id);
+        pthread_mutex_unlock(&frt->lock);
+        return true;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    /* Legacy: single-task mode. This path credits the wait to cycle_count, so
+     * it must not also credit virtual_time_us -- the two are summed into the
+     * guest clock and this is the one site that could pay the same interval
+     * twice. */
+    cpu->cycle_count += advance;
+    xtensa_advance_idle_cycles(cpu, advance);
+    return false;
+}
+
+/* Block for `us` microseconds of guest time. Shared with the Arduino
+ * delay()/usleep() shims so they yield exactly like the vTaskDelay() they
+ * wrap on real hardware.
+ *
+ * Returns false *without side effects* when there is no scheduler to block
+ * on, so the caller can apply its own fast-forward. Falling back to
+ * frt_block_cycles()'s legacy path here would be wrong: that advances
+ * cycle_count, which counts executed guest instructions and bounds every
+ * fixture harness, and a pre-scheduler delay() loop would exhaust those
+ * budgets without the guest making any progress. */
+bool freertos_stubs_sleep_us(freertos_stubs_t *frt, xtensa_cpu_t *cpu,
+                             uint64_t us) {
+    if (!frt || !cpu) return false;
+    int core_id = cpu->core_id;
+    pthread_mutex_lock(&frt->lock);
+    bool schedulable = frt->scheduler_started &&
+                       frt->current_task[core_id] >= 0;
+    pthread_mutex_unlock(&frt->lock);
+    if (!schedulable) return false;
+    frt_refresh_cpu_frequency(frt, cpu);
+    return frt_block_cycles(frt, cpu, us * frt->cpu_freq_mhz);
+}
+
+/* vTaskDelay(ticks) — yield to scheduler or advance ccount */
+void stub_vTaskDelay(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    frt_refresh_cpu_frequency(frt, cpu);
+    uint32_t ticks = frt_arg(cpu, 0);
+    if (!frt_block_cycles(frt, cpu, frt_ticks_to_cycles(frt, cpu, ticks)))
+        frt_return_void(cpu);
+}
+
+/* xTaskCreate(func, name, stack, param, prio, handle_out) -> pdPASS */
+void stub_xTaskCreate(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t task_fn    = frt_arg(cpu, 0);
+    uint32_t name_addr  = frt_arg(cpu, 1);
+    uint32_t task_par   = frt_arg(cpu, 3);
+    uint32_t prio       = frt_arg(cpu, 4);
+    uint32_t handle_out = frt_arg(cpu, 5);
+
+    char task_name[16] = "?";
+    if (name_addr)
+        frt_read_string(cpu, name_addr, task_name, sizeof(task_name));
+
+    pthread_mutex_lock(&frt->lock);
+
+    uint32_t fake_handle = 0;
+    if (handle_out) {
+        fake_handle = bump_alloc(frt, 4);
+        if (fake_handle)
+            mem_write32(cpu->mem, handle_out, fake_handle);
+    }
+
+    /* Register in scheduler if app-level task (priority < 20) */
+    if (task_fn && prio < 20) {
+        if (!fake_handle) fake_handle = bump_alloc(frt, 4);
+        int idx = sched_register_task(frt, task_fn, task_par, (uint8_t)prio,
+                                      fake_handle, -1);  /* no affinity */
+        if (idx >= 0)
+            memcpy(frt->tasks[idx].name, task_name, sizeof(task_name));
+        /* If we're in legacy single-task mode, promote to scheduler */
+        if (!frt->scheduler_started && frt->task_count > 1)
+            sched_promote_legacy(frt);
+    }
+
+    /* Legacy deferred task (for single-task compat) */
+    if (!frt->deferred_task_fn && task_fn) {
+        frt->deferred_task_fn = task_fn;
+        frt->deferred_task_param = task_par;
+    }
+
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdPASS);
+}
+
+/* xTaskCreatePinnedToCore(func, name, stack, param, prio, handle_out, core) -> pdPASS */
+void stub_xTaskCreatePinnedToCore(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t task_fn    = frt_arg(cpu, 0);
+    uint32_t name_addr  = frt_arg(cpu, 1);
+    uint32_t task_par   = frt_arg(cpu, 3);
+    uint32_t prio       = frt_arg(cpu, 4);
+    uint32_t handle_out = frt_arg(cpu, 5);
+    int32_t  core       = (int32_t)frt_arg(cpu, 6);
+
+    /* tskNO_AFFINITY is typically 0x7FFFFFFF or -1 */
+    int affinity = (core < 0 || core > 1) ? -1 : core;
+
+    char task_name[16] = "?";
+    if (name_addr)
+        frt_read_string(cpu, name_addr, task_name, sizeof(task_name));
+
+    pthread_mutex_lock(&frt->lock);
+
+    uint32_t fake_handle = 0;
+    if (handle_out) {
+        fake_handle = bump_alloc(frt, 4);
+        if (fake_handle)
+            mem_write32(cpu->mem, handle_out, fake_handle);
+    }
+
+    /* Register in scheduler if app-level task (priority < 20) */
+    if (task_fn && prio < 20) {
+        if (!fake_handle) fake_handle = bump_alloc(frt, 4);
+        int idx = sched_register_task(frt, task_fn, task_par, (uint8_t)prio,
+                                      fake_handle, affinity);
+        if (idx >= 0)
+            memcpy(frt->tasks[idx].name, task_name, sizeof(task_name));
+        /* If we're in legacy single-task mode, promote to scheduler */
+        if (!frt->scheduler_started && frt->task_count > 1)
+            sched_promote_legacy(frt);
+    }
+
+    /* Legacy: save most recent task for deferred execution */
+    if (task_fn) {
+        frt->deferred_task_fn = task_fn;
+        frt->deferred_task_param = task_par;
+    }
+
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdPASS);
+}
+
+/* vTaskDelete(handle) — remove task from scheduler or no-op */
+void stub_vTaskDelete(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    if (frt->scheduler_started) {
+        frt_return_void(cpu);
+        if (handle == 0 && frt->current_task[core_id] >= 0) {
+            /* Delete self: mark UNUSED and switch away */
+            frt->tasks[frt->current_task[core_id]].state = TASK_UNUSED;
+            sched_switch(frt, core_id);
+        } else {
+            /* Delete by handle — find and mark UNUSED */
+            for (int i = 0; i < frt->task_count; i++) {
+                if (frt->tasks[i].handle == handle && frt->tasks[i].state != TASK_UNUSED) {
+                    frt->tasks[i].state = TASK_UNUSED;
+                    break;
+                }
+            }
+        }
+    } else {
+        frt_return_void(cpu);
+    }
+    pthread_mutex_unlock(&frt->lock);
+}
+
+/* ===== Event groups ===== */
+
+static event_group_t *find_event_group(freertos_stubs_t *frt, uint32_t handle) {
+    for (int i = 0; i < frt->event_group_count; i++)
+        if (frt->event_groups[i].used && frt->event_groups[i].handle == handle)
+            return &frt->event_groups[i];
+    return NULL;
+}
+
+static uint32_t eg_current_bits(freertos_stubs_t *frt, uint32_t handle) {
+    event_group_t *g = find_event_group(frt, handle);
+    return g ? g->bits : 0u;
+}
+
+static bool eg_condition_met(uint32_t bits, uint32_t wanted, bool wait_all) {
+    if (wanted == 0u) return true;
+    return wait_all ? ((bits & wanted) == wanted) : ((bits & wanted) != 0u);
+}
+
+/* Wake every task whose wait is satisfied by the group's current bits.
+ * Called with frt->lock held. Each woken task takes its result from the bits
+ * as they stood when its condition was met, before any clear-on-exit, which
+ * is what FreeRTOS reports. */
+static void eg_wake_waiters_locked(freertos_stubs_t *frt, event_group_t *g) {
+    if (!frt->scheduler_started) return;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (!t->eg_waiting || t->eg_handle != g->handle) continue;
+        if (!eg_condition_met(g->bits, t->eg_bits, t->eg_wait_all)) continue;
+
+        t->ar[t->ret_ar_slot] = g->bits;
+        if (t->eg_clear_on_exit)
+            g->bits &= ~t->eg_bits;
+        t->eg_waiting = false;
+
+        bool is_current = false;
+        for (int core = 0; core < 2; core++) {
+            if (frt->current_task[core] != i) continue;
+            is_current = true;
+            if (frt->cpu[core]) {
+                frt->cpu[core]->running = true;
+                frt->cpu[core]->halted = false;
+            }
+        }
+        t->state = is_current ? TASK_RUNNING : TASK_READY;
+    }
+}
+
+void stub_xEventGroupCreate(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = NULL;
+    for (int i = 0; i < frt->event_group_count; i++)
+        if (!frt->event_groups[i].used) { g = &frt->event_groups[i]; break; }
+    if (!g) {
+        if (frt->event_group_count >= MAX_EVENT_GROUPS) {
+            pthread_mutex_unlock(&frt->lock);
+            frt_return(cpu, 0);
+            return;
+        }
+        g = &frt->event_groups[frt->event_group_count++];
+    }
+    uint32_t handle = bump_alloc(frt, 4);
+    if (handle == 0) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, 0);
+        return;
+    }
+    g->used = true;
+    g->handle = handle;
+    g->bits = 0;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+/* xEventGroupSetBits(group, bits) -> bits after the call. */
+static uint32_t eg_set_bits(freertos_stubs_t *frt, uint32_t handle,
+                            uint32_t bits) {
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, handle);
+    if (!g) { pthread_mutex_unlock(&frt->lock); return 0; }
+    g->bits |= bits;
+    eg_wake_waiters_locked(frt, g);
+    uint32_t result = g->bits;
+    pthread_mutex_unlock(&frt->lock);
+    return result;
+}
+
+void stub_xEventGroupSetBits(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    frt_return(cpu, eg_set_bits(frt, frt_arg(cpu, 0), frt_arg(cpu, 1)));
+}
+
+/* xEventGroupSetBitsFromISR(group, bits, pxHigherPriorityTaskWoken) */
+void stub_xEventGroupSetBitsFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t woken_ptr = frt_arg(cpu, 2);
+    (void)eg_set_bits(frt, frt_arg(cpu, 0), frt_arg(cpu, 1));
+    if (woken_ptr) mem_write32(cpu->mem, woken_ptr, pdFALSE);
+    frt_return(cpu, pdPASS);
+}
+
+/* xEventGroupClearBits(group, bits) -> bits *before* the clear. This is also
+ * xEventGroupGetBits(), which is a macro for clearing nothing. */
+void stub_xEventGroupClearBits(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0), bits = frt_arg(cpu, 1);
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, handle);
+    uint32_t before = g ? g->bits : 0u;
+    if (g) g->bits &= ~bits;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, before);
+}
+
+/* xEventGroupClearBitsFromISR(group, bits) -> pdPASS, unlike the task
+ * version, which returns the bits. */
+void stub_xEventGroupClearBitsFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, frt_arg(cpu, 0));
+    if (g) g->bits &= ~frt_arg(cpu, 1);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdPASS);
+}
+
+void stub_xEventGroupGetBitsFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t bits = eg_current_bits(frt, frt_arg(cpu, 0));
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, bits);
+}
+
+void stub_vEventGroupDelete(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, frt_arg(cpu, 0));
+    if (g) {
+        /* Waiters on a deleted group are released with the bits they can
+         * still see, rather than being left blocked forever. */
+        g->bits = 0;
+        for (int i = 0; i < frt->task_count; i++) {
+            task_tcb_t *t = &frt->tasks[i];
+            if (!t->eg_waiting || t->eg_handle != g->handle) continue;
+            t->ar[t->ret_ar_slot] = 0u;
+            t->eg_waiting = false;
+            t->state = TASK_READY;
+        }
+        g->used = false;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return_void(cpu);
+}
+
+/* Shared body of xEventGroupWaitBits() and xEventGroupSync(). */
+static void eg_wait(xtensa_cpu_t *cpu, freertos_stubs_t *frt, uint32_t handle,
+                    uint32_t wait_bits, bool clear_on_exit, bool wait_all,
+                    uint32_t timeout) {
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    event_group_t *g = find_event_group(frt, handle);
+    if (!g) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, 0);
+        return;
+    }
+    if (eg_condition_met(g->bits, wait_bits, wait_all)) {
+        uint32_t result = g->bits;
+        if (clear_on_exit) g->bits &= ~wait_bits;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, result);
+        return;
+    }
+    if (timeout == 0u || !frt->scheduler_started ||
+        frt->current_task[core_id] < 0) {
+        uint32_t result = g->bits;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, result);
+        return;
+    }
+
+    /* Block. The return register is patched at wake time -- by the setter, or
+     * by sched_wake_sleepers on timeout -- so record which slot it is before
+     * frt_return() zeroes CALLINC. */
+    task_tcb_t *task = &frt->tasks[frt->current_task[core_id]];
+    task->ret_ar_slot = frt_return_slot(cpu);
+    frt_return(cpu, g->bits);
+    sched_save_context(frt, core_id);
+    task->eg_handle = handle;
+    task->eg_bits = wait_bits;
+    task->eg_clear_on_exit = clear_on_exit;
+    task->eg_wait_all = wait_all;
+    task->eg_waiting = true;
+    if (timeout == UINT32_MAX) {
+        task->state = TASK_BLOCKED_EVENTGROUP;
+    } else {
+        uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+        if (advance > 200000000ULL) advance = 200000000ULL;
+        task->state = TASK_SLEEPING;
+        task->wake_cycle = cpu->cycle_count + advance;
+    }
+    sched_switch(frt, core_id);
+    pthread_mutex_unlock(&frt->lock);
+}
+
+/* xEventGroupWaitBits(group, bits, clear_on_exit, wait_for_all, ticks) */
+void stub_xEventGroupWaitBits(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    eg_wait(cpu, frt, frt_arg(cpu, 0), frt_arg(cpu, 1),
+            frt_arg(cpu, 2) != 0, frt_arg(cpu, 3) != 0, frt_arg(cpu, 4));
+}
+
+/* xEventGroupSync(group, bits_to_set, bits_to_wait_for, ticks): set, then
+ * wait for all, clearing on exit. */
+void stub_xEventGroupSync(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    (void)eg_set_bits(frt, handle, frt_arg(cpu, 1));
+    eg_wait(cpu, frt, handle, frt_arg(cpu, 2), true, true, frt_arg(cpu, 3));
+}
+
+/* ===== Software timers ===== */
+
+#define SW_TIMER_TICK_US (1000000u / FLEXE_FREERTOS_HZ)
+
+static sw_timer_t *find_sw_timer(freertos_stubs_t *frt, uint32_t handle) {
+    for (int i = 0; i < frt->sw_timer_count; i++)
+        if (frt->sw_timers[i].used && frt->sw_timers[i].handle == handle)
+            return &frt->sw_timers[i];
+    return NULL;
+}
+
+static uint64_t sw_timer_now_us(freertos_stubs_t *frt, xtensa_cpu_t *cpu) {
+    frt_refresh_cpu_frequency(frt, cpu);
+    return xtensa_guest_time_us(cpu, frt->cpu_freq_mhz);
+}
+
+static void sw_timer_create(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                            uint32_t name, uint32_t period_ticks,
+                            uint32_t autoreload, uint32_t id, uint32_t cb) {
+    sw_timer_t *t = NULL;
+    for (int i = 0; i < frt->sw_timer_count; i++)
+        if (!frt->sw_timers[i].used) { t = &frt->sw_timers[i]; break; }
+    if (!t) {
+        if (frt->sw_timer_count >= MAX_SW_TIMERS) { frt_return(cpu, 0); return; }
+        t = &frt->sw_timers[frt->sw_timer_count++];
+    }
+    uint32_t handle = bump_alloc(frt, 4);
+    if (handle == 0) { frt_return(cpu, 0); return; }
+
+    memset(t, 0, sizeof(*t));
+    t->used = true;
+    t->handle = handle;
+    t->name_addr = name;
+    /* A zero period is invalid in FreeRTOS; clamp to one tick rather than
+     * dividing by it later. */
+    t->period_ticks = period_ticks ? period_ticks : 1u;
+    t->autoreload = autoreload != 0;
+    t->id = id;
+    t->callback_addr = cb;
+    frt_return(cpu, handle);
+}
+
+/* xTimerCreate(name, period_ticks, autoreload, id, callback) */
+void stub_xTimerCreate(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_create(cpu, frt, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                    frt_arg(cpu, 2), frt_arg(cpu, 3), frt_arg(cpu, 4));
+}
+
+/* xTimerCreateStatic(name, period, autoreload, id, callback, buffer) — the
+ * caller-supplied buffer is ignored; the handle is ours either way. */
+void stub_xTimerCreateStatic(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_create(cpu, frt, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                    frt_arg(cpu, 2), frt_arg(cpu, 3), frt_arg(cpu, 4));
+}
+
+/* xTimerGenericCommand(timer, command, optional_value, woken, ticks_to_wait).
+ * xTimerStart/Stop/Reset/ChangePeriod/Delete are all macros over this. */
+void stub_xTimerGenericCommand(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    int32_t  command = (int32_t)frt_arg(cpu, 1);
+    uint32_t optional = frt_arg(cpu, 2);
+
+    sw_timer_t *t = find_sw_timer(frt, handle);
+    if (!t) { frt_return(cpu, pdFALSE); return; }
+
+    uint64_t now = sw_timer_now_us(frt, cpu);
+    switch (command) {
+    case tmrCOMMAND_START:
+    case tmrCOMMAND_START_DONT_TRACE:
+    case tmrCOMMAND_RESET:
+    case tmrCOMMAND_START_FROM_ISR:
+    case tmrCOMMAND_RESET_FROM_ISR:
+        t->active = true;
+        t->alarm_us = now + (uint64_t)t->period_ticks * SW_TIMER_TICK_US;
+        break;
+    case tmrCOMMAND_STOP:
+    case tmrCOMMAND_STOP_FROM_ISR:
+        t->active = false;
+        break;
+    case tmrCOMMAND_CHANGE_PERIOD:
+    case tmrCOMMAND_CHANGE_PERIOD_FROM_ISR:
+        /* FreeRTOS starts a timer whose period is changed, whether or not it
+         * was running. */
+        t->period_ticks = optional ? optional : 1u;
+        t->active = true;
+        t->alarm_us = now + (uint64_t)t->period_ticks * SW_TIMER_TICK_US;
+        break;
+    case tmrCOMMAND_DELETE:
+        t->used = false;
+        t->active = false;
+        break;
+    case tmrCOMMAND_EXECUTE_CALLBACK:
+    case tmrCOMMAND_EXECUTE_CALLBACK_FROM_ISR:
+        /* xTimerPendFunctionCall(): the "timer" carries the function and one
+         * argument rather than a deadline. */
+        t->active = false;
+        break;
+    default:
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+    frt_return(cpu, pdPASS);
+}
+
+void stub_xTimerIsTimerActive(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, (t && t->active) ? pdTRUE : pdFALSE);
+}
+
+void stub_pvTimerGetTimerID(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, t ? t->id : 0);
+}
+
+void stub_vTimerSetTimerID(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    if (t) t->id = frt_arg(cpu, 1);
+    frt_return_void(cpu);
+}
+
+void stub_pcTimerGetName(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, t ? t->name_addr : 0);
+}
+
+void stub_xTimerGetPeriod(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, t ? t->period_ticks : 0);
+}
+
+void stub_xTimerGetExpiryTime(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    sw_timer_t *t = find_sw_timer(frt, frt_arg(cpu, 0));
+    frt_return(cpu, t ? (uint32_t)(t->alarm_us / SW_TIMER_TICK_US) : 0);
+}
+
+/* Deliver any software timers that have come due.
+ *
+ * Called once per execution batch, outside frt->lock: the callback re-enters
+ * guest code and may call straight back into these stubs, so holding the lock
+ * here would deadlock exactly as the peripheral dispatch path does. Each
+ * timer's own state is settled *before* its callback runs, so a callback that
+ * stops or restarts its own timer wins over the reload.
+ */
+void freertos_stubs_tick(freertos_stubs_t *frt) {
+    if (!frt || !frt->cpu[0]) return;
+    xtensa_cpu_t *cpu = frt->cpu[0];
+    uint64_t now = sw_timer_now_us(frt, cpu);
+
+    for (int i = 0; i < frt->sw_timer_count; i++) {
+        sw_timer_t *t = &frt->sw_timers[i];
+        if (!t->used || !t->active || now < t->alarm_us) continue;
+
+        uint32_t handle = t->handle;
+        uint32_t cb = t->callback_addr;
+        if (t->autoreload)
+            t->alarm_us += (uint64_t)t->period_ticks * SW_TIMER_TICK_US;
+        else
+            t->active = false;
+        if (cb)
+            (void)guest_call8(cpu, cb, &handle, 1, SW_TIMER_CALLBACK_INSNS,
+                              NULL);
+    }
+}
+
+/* Current tick count, on the same clock stub_xTaskGetTickCount() reports. */
+static uint32_t frt_tick_count(freertos_stubs_t *frt, xtensa_cpu_t *cpu) {
+    frt_refresh_cpu_frequency(frt, cpu);
+    return (uint32_t)(xtensa_guest_time_us(cpu, frt->cpu_freq_mhz) /
+                      (1000000u / FLEXE_FREERTOS_HZ));
+}
+
+/* vTaskDelayUntil(&previous_wake, increment) / xTaskDelayUntil(...).
+ *
+ * This was not hooked, so the guest ran FreeRTOS's own version, which parks
+ * the task on the real delayed-task list and yields -- neither of which
+ * Flexe's scheduler acts on. It returned immediately, every time: a
+ * fixed-rate loop of ten 20 ms periods completed in 0 us and then span at
+ * full speed. Unlike a missing vTaskDelay this does not look like a hang, it
+ * looks like firmware running impossibly fast.
+ *
+ * The deadline is absolute, which is the whole point of the call: the wake
+ * time advances by the increment regardless of how long the body took, so a
+ * loop keeps its rate instead of drifting by its own execution time.
+ */
+static void frt_delay_until(xtensa_cpu_t *cpu, void *ctx, bool returns_status) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t prev_ptr = frt_arg(cpu, 0);
+    uint32_t increment = frt_arg(cpu, 1);
+
+    uint32_t previous = prev_ptr ? mem_read32(cpu->mem, prev_ptr) : 0u;
+    uint32_t target = previous + increment;
+    if (prev_ptr) mem_write32(cpu->mem, prev_ptr, target);
+
+    /* Signed difference, so a tick counter that has wrapped past the target
+     * is recognised as "already due" rather than as a near-infinite wait. */
+    int32_t remaining = (int32_t)(target - frt_tick_count(frt, cpu));
+    if (remaining <= 0) {
+        /* The deadline has already passed: FreeRTOS does not block, and
+         * reports that it did not. */
+        if (returns_status) frt_return(cpu, pdFALSE);
+        else frt_return_void(cpu);
+        return;
+    }
+    if (!frt_block_cycles(frt, cpu,
+                          frt_ticks_to_cycles(frt, cpu, (uint32_t)remaining))) {
+        if (returns_status) frt_return(cpu, pdTRUE);
+        else frt_return_void(cpu);
+    }
+}
+
+void stub_vTaskDelayUntil(xtensa_cpu_t *cpu, void *ctx) {
+    frt_delay_until(cpu, ctx, false);
+}
+
+void stub_xTaskDelayUntil(xtensa_cpu_t *cpu, void *ctx) {
+    frt_delay_until(cpu, ctx, true);
+}
+
+/* xTaskGetTickCount() -> virtual ticks (1 kHz) */
+void stub_xTaskGetTickCount(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    frt_refresh_cpu_frequency(frt, cpu);
+    uint64_t total_us = xtensa_guest_time_us(cpu, frt->cpu_freq_mhz);
+    uint32_t ticks = (uint32_t)(total_us /
+                                (1000000u / FLEXE_FREERTOS_HZ));
+    frt_return(cpu, ticks);
+}
+
+static uint32_t queue_create_locked(freertos_stubs_t *frt, uint32_t length,
+                                    uint32_t item_size, int initial_count,
+                                    uint32_t preferred_handle) {
+    /* Data queues need fixed host storage, but semaphores store only a count
+     * and ESP-IDF legitimately creates one with UINT32_MAX capacity. */
+    if (item_size > MAX_ITEM_SIZE || length == 0 ||
+        (item_size != 0 && length > MAX_QUEUE_ITEMS))
+        return 0;
+
+    int slot = -1;
+    for (int i = 0; i < frt->queue_count; i++) {
+        if (preferred_handle && frt->queues[i].handle == preferred_handle)
+            return preferred_handle;
+        if (slot < 0 && frt->queues[i].handle == 0) slot = i;
+    }
+    if (slot < 0) {
+        if (frt->queue_count >= MAX_QUEUES) return 0;
+        slot = frt->queue_count++;
+    }
+
+    queue_t *q = &frt->queues[slot];
+    uint32_t handle = preferred_handle ? preferred_handle :
+                                          bump_alloc(frt, 4);
+    if (!handle) return 0;
+
+    memset(q, 0, sizeof(*q));
+    q->handle = handle;
+    q->item_size = (int)item_size;
+    q->max_items = length > 0x7FFFFFFFu ? 0x7FFFFFFF : (int)length;
+    q->count = initial_count > q->max_items ? q->max_items : initial_count;
+    return handle;
+}
+
+/* xQueueCreate(length, item_size) -> handle */
+void stub_xQueueCreate(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t length = frt_arg(cpu, 0);
+    uint32_t item_size = frt_arg(cpu, 1);
+
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = queue_create_locked(frt, length, item_size, 0, 0);
+    pthread_mutex_unlock(&frt->lock);
+
+    frt_return(cpu, handle);
+}
+
+/* Find queue by handle */
+static queue_t *find_queue(freertos_stubs_t *frt, uint32_t handle) {
+    for (int i = 0; i < frt->queue_count; i++)
+        if (frt->queues[i].handle == handle)
+            return &frt->queues[i];
+    return NULL;
+}
+
+static bool wake_queue_waiter_locked(freertos_stubs_t *frt,
+                                     uint32_t handle) {
+    if (!frt->scheduler_started) return false;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (!t->q_waiting || t->q_is_sender || t->blocked_queue != handle)
+            continue;
+
+        if (!t->q_is_semaphore) {
+            /* Hand the item over here, on the waiter's behalf. The blocked
+             * xQueueReceive() call cannot re-run when the task resumes -- it
+             * continues after the call with whatever is in its return
+             * register -- so if the wake does not dequeue, nobody does: the
+             * receiver reports failure while its item sits in the queue.
+             * Semaphore waiters take the token directly instead, which is
+             * why stub_queue_send() skips the enqueue when one is woken. */
+            queue_t *q = find_queue(frt, handle);
+            if (!q || q->count == 0) continue;
+            if (q->item_size > 0 && t->q_recv_buf && frt->cpu[0]) {
+                int offset = q->head * q->item_size;
+                for (int k = 0; k < q->item_size; k++)
+                    mem_write8(frt->cpu[0]->mem,
+                               t->q_recv_buf + (uint32_t)k,
+                               q->buf[offset + k]);
+            }
+            if (!t->q_peek) {
+                q->head = (q->head + 1) % q->max_items;
+                q->count--;
+            }
+        }
+
+        if (t->q_is_semaphore) {
+            /* A woken mutex waiter becomes the owner, so a recursive take
+             * from that task re-enters instead of blocking on itself. */
+            queue_t *mq = find_queue(frt, handle);
+            if (mq && mq->is_mutex) {
+                mq->mutex_owner = t->handle;
+                mq->mutex_depth = 1;
+            }
+        }
+        t->ar[t->ret_ar_slot] = pdTRUE;
+        t->q_waiting = false;
+        t->blocked_queue = 0;
+
+        bool is_current = false;
+        for (int core = 0; core < 2; core++) {
+            if (frt->current_task[core] != i) continue;
+            is_current = true;
+            if (frt->cpu[core]) {
+                frt->cpu[core]->running = true;
+                frt->cpu[core]->halted = false;
+            }
+        }
+        t->state = is_current ? TASK_RUNNING : TASK_READY;
+        return true;
+    }
+    return false;
+}
+
+
+/* ===== Queue accessors =====
+ *
+ * These were not hooked, so the guest ran FreeRTOS's own implementations
+ * against the real queue structure -- which Flexe never populates, since
+ * every queue operation is serviced from its own storage. They therefore
+ * reported an empty queue no matter what was in it.
+ */
+
+static uint32_t queue_count_of(freertos_stubs_t *frt, uint32_t handle) {
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    uint32_t n = q ? (uint32_t)q->count : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    return n;
+}
+
+/* uxQueueMessagesWaiting(queue), and uxSemaphoreGetCount(), which FreeRTOS
+ * defines as a macro over it but which some builds emit as its own symbol. */
+void stub_uxQueueMessagesWaiting(xtensa_cpu_t *cpu, void *ctx) {
+    frt_return(cpu, queue_count_of(ctx, frt_arg(cpu, 0)));
+}
+
+void stub_uxQueueSpacesAvailable(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, frt_arg(cpu, 0));
+    uint32_t n = q ? (uint32_t)(q->max_items - q->count) : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, n);
+}
+
+void stub_xQueueIsQueueEmptyFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    frt_return(cpu, queue_count_of(ctx, frt_arg(cpu, 0)) == 0u ? pdTRUE
+                                                               : pdFALSE);
+}
+
+/* xQueueReset(queue) -> pdPASS. Waiters stay blocked, as on hardware. */
+void stub_xQueueReset(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, frt_arg(cpu, 0));
+    if (q) { q->count = 0; q->head = 0; q->tail = 0; }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdPASS);
+}
+
+/* xQueuePeekFromISR(queue, buffer): copy the head item, leave it queued. */
+void stub_xQueuePeekFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t buf_ptr = frt_arg(cpu, 1);
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, frt_arg(cpu, 0));
+    bool got = q && q->count > 0;
+    if (got && q->item_size > 0 && buf_ptr) {
+        int offset = q->head * q->item_size;
+        for (int i = 0; i < q->item_size; i++)
+            mem_write8(cpu->mem, buf_ptr + (uint32_t)i, q->buf[offset + i]);
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, got ? pdTRUE : pdFALSE);
+}
+
+/* Copy one item into the queue. Shared by stub_queue_send() and by the wake
+ * path, which has to complete a blocked send on the sender's behalf. */
+static void queue_enqueue_locked(xtensa_mem_t *mem, queue_t *q,
+                                 uint32_t item_ptr, uint32_t copy_position,
+                                 bool overwrite) {
+    int slot;
+    if (overwrite && q->count != 0) {
+        slot = q->head;
+    } else if (copy_position == 1u) { /* queueSEND_TO_FRONT */
+        q->head = (q->head + q->max_items - 1) % q->max_items;
+        slot = q->head;
+    } else {
+        slot = q->tail;
+    }
+    int offset = slot * q->item_size;
+    for (int i = 0; i < q->item_size; i++)
+        q->buf[offset + i] = mem_read8(mem, item_ptr + (uint32_t)i);
+    if (!overwrite || q->count == 0) {
+        if (copy_position != 1u)
+            q->tail = (q->tail + 1) % q->max_items;
+        q->count++;
+    }
+}
+
+/* Complete one send that was blocked on a full queue, now that a slot has
+ * freed. Same contract as the receiver side: the blocked call cannot re-run,
+ * so the item is enqueued here and the return register patched to pdTRUE. */
+static bool wake_queue_sender_locked(freertos_stubs_t *frt, uint32_t handle) {
+    if (!frt->scheduler_started || !frt->cpu[0]) return false;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (!t->q_waiting || !t->q_is_sender || t->blocked_queue != handle)
+            continue;
+        queue_t *q = find_queue(frt, handle);
+        if (!q || q->count >= q->max_items) continue;
+
+        queue_enqueue_locked(frt->cpu[0]->mem, q, t->q_recv_buf,
+                             t->q_copy_pos, false);
+        t->ar[t->ret_ar_slot] = pdTRUE;
+        t->q_waiting = false;
+        t->q_is_sender = false;
+        t->blocked_queue = 0;
+
+        bool is_current = false;
+        for (int core = 0; core < 2; core++) {
+            if (frt->current_task[core] != i) continue;
+            is_current = true;
+            if (frt->cpu[core]) {
+                frt->cpu[core]->running = true;
+                frt->cpu[core]->halted = false;
+            }
+        }
+        t->state = is_current ? TASK_RUNNING : TASK_READY;
+        return true;
+    }
+    return false;
+}
+
+static void stub_queue_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                            uint32_t copy_position) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item_ptr = frt_arg(cpu, 1);
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    bool semaphore = q->item_size == 0;
+    bool woke_waiter = semaphore &&
+                       wake_queue_waiter_locked(frt, handle);
+
+    bool overwrite = copy_position == 2u && q->max_items == 1;
+    if (woke_waiter) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    if (q->count >= q->max_items && !overwrite) {
+        /* Full. With a timeout, block until a receive frees a slot -- the
+         * flow-control half of a bounded producer/consumer, which used to
+         * report failure immediately however long the caller was willing to
+         * wait. */
+        uint32_t timeout = frt_arg(cpu, 2);
+        if (timeout != 0u && frt->scheduler_started &&
+            frt->current_task[cpu->core_id] >= 0) {
+            int core_id = cpu->core_id;
+            task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+            t->ret_ar_slot = frt_return_slot(cpu);
+            frt_return(cpu, pdFALSE);
+            sched_save_context(frt, core_id);
+            t->blocked_queue = handle;
+            t->q_recv_buf = item_ptr;
+            t->q_copy_pos = (uint8_t)copy_position;
+            t->q_waiting = true;
+            t->q_is_sender = true;
+            t->q_is_semaphore = false;
+            t->q_peek = false;
+            if (timeout == UINT32_MAX) {
+                t->state = TASK_BLOCKED_QUEUE;
+            } else {
+                uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+                if (advance > 200000000ULL) advance = 200000000ULL;
+                t->state = TASK_SLEEPING;
+                t->wake_cycle = cpu->cycle_count + advance;
+            }
+            sched_switch(frt, core_id);
+            pthread_mutex_unlock(&frt->lock);
+            return;
+        }
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+
+    queue_enqueue_locked(cpu->mem, q, item_ptr, copy_position, overwrite);
+
+    /* Wake one task blocked on an ordinary data queue. Semaphore waiters
+     * consume the token directly above instead of leaving a surplus give. */
+    if (!semaphore) (void)wake_queue_waiter_locked(frt, handle);
+    pthread_mutex_unlock(&frt->lock);
+
+    frt_return(cpu, pdTRUE);
+}
+
+/* xQueueSend(queue, item, timeout) -> pdTRUE */
+void stub_xQueueSend(xtensa_cpu_t *cpu, void *ctx) {
+    stub_queue_send(cpu, ctx, 0); /* queueSEND_TO_BACK */
+}
+
+/* xQueueSendFromISR — same as xQueueSend but with extra arg */
+void stub_xQueueSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    stub_queue_send(cpu, ctx, 0); /* queueSEND_TO_BACK */
+}
+
+static bool dispatch_peripherals_until_queue(freertos_stubs_t *frt,
+                                             xtensa_cpu_t *waiting_cpu,
+                                             uint32_t handle,
+                                             uint64_t budget,
+                                             uint64_t *advanced) {
+    uint64_t elapsed = 0u;
+    for (unsigned dispatched = 0;
+         dispatched < 1024u && elapsed < budget;
+         dispatched++) {
+        xtensa_cpu_t *event_cpu = NULL;
+        uint32_t event = UINT32_MAX;
+        uint32_t distance = UINT32_MAX;
+        for (unsigned core = 0; core < 2u; core++) {
+            xtensa_cpu_t *candidate = frt->cpu[core];
+            if (!candidate || !candidate->periph_next_event ||
+                !candidate->periph_event)
+                continue;
+            /* next_timer_event covers the ccompare deadlines as well as the
+             * peripheral ones. Searching only periph_next_event() stepped this
+             * pump straight over the guest's own FreeRTOS tick for the whole
+             * time a task sat in a blocking receive. */
+            uint32_t candidate_event = candidate->next_timer_event;
+            uint32_t periph_event_at = candidate->periph_next_event(candidate);
+            if (periph_event_at != UINT32_MAX &&
+                (candidate_event == UINT32_MAX ||
+                 (uint32_t)(periph_event_at - candidate->ccount) <
+                 (uint32_t)(candidate_event - candidate->ccount)))
+                candidate_event = periph_event_at;
+            if (candidate_event == UINT32_MAX) continue;
+            uint32_t candidate_distance =
+                candidate_event - candidate->ccount;
+            if ((int32_t)candidate_distance < 0)
+                candidate_distance = 0u;
+            if (!event_cpu || candidate_distance < distance) {
+                event_cpu = candidate;
+                event = candidate_event;
+                distance = candidate_distance;
+            }
+        }
+        if (!event_cpu || (uint64_t)distance > budget - elapsed) break;
+
+        waiting_cpu->ccount += distance;
+        if (event_cpu != waiting_cpu) event_cpu->ccount += distance;
+        waiting_cpu->virtual_time_us +=
+            distance / frt->cpu_freq_mhz;
+        elapsed += distance;
+        /* Fire everything now due, not just the peripheral models:
+         * xtensa_fire_due_timers() raises the ccompare interrupts and then
+         * calls periph_event() itself, so this is the same peripheral step
+         * plus the ccompare deadlines the pump used to skip. */
+        xtensa_fire_due_timers(event_cpu);
+        if (event_cpu != waiting_cpu) xtensa_fire_due_timers(waiting_cpu);
+
+        pthread_mutex_lock(&frt->lock);
+        queue_t *q = find_queue(frt, handle);
+        bool ready = q && q->count != 0;
+        pthread_mutex_unlock(&frt->lock);
+        if (ready) {
+            if (advanced) *advanced = elapsed;
+            return true;
+        }
+        if (distance == 0u &&
+            event_cpu->periph_next_event(event_cpu) == event)
+            break;
+    }
+    if (advanced) *advanced = elapsed;
+    return false;
+}
+
+/* xQueueReceive(queue, buf, timeout) -> pdTRUE/pdFALSE */
+/* Shared body of xQueueReceive() and xQueuePeek(); a peek copies the head
+ * item without removing it. */
+static void queue_receive(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                          bool peek) {
+    frt_refresh_cpu_frequency(frt, cpu);
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t buf_ptr = frt_arg(cpu, 1);
+    uint32_t timeout = frt_arg(cpu, 2);
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+
+    if (q->count == 0) {
+        uint64_t hardware_advance = 0u;
+        uint64_t timeout_cycles = 0u;
+        if (timeout > 0u && timeout != UINT32_MAX) {
+            timeout_cycles = frt_ticks_to_cycles(frt, cpu, timeout);
+            if (timeout_cycles > 200000000ULL)
+                timeout_cycles = 200000000ULL;
+            pthread_mutex_unlock(&frt->lock);
+            bool ready = dispatch_peripherals_until_queue(
+                frt, cpu, handle, timeout_cycles, &hardware_advance);
+            pthread_mutex_lock(&frt->lock);
+            q = find_queue(frt, handle);
+            if (!q) {
+                pthread_mutex_unlock(&frt->lock);
+                frt_return(cpu, pdFALSE);
+                return;
+            }
+            if (ready && q->count != 0)
+                goto dequeue_locked;
+        }
+        if (frt->scheduler_started && frt->current_task[core_id] >= 0 &&
+            timeout > 0) {
+            /* Block. The return register is patched to pdTRUE by whichever
+             * send hands us an item; pdFALSE stands if the timeout wins. */
+            task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+            t->ret_ar_slot = frt_return_slot(cpu);
+            frt_return(cpu, pdFALSE);
+            sched_save_context(frt, core_id);
+            t->blocked_queue = handle;
+            t->q_recv_buf = buf_ptr;
+            t->q_waiting = true;
+            t->q_is_semaphore = false;
+            t->q_peek = peek;
+            if (timeout == 0xFFFFFFFFu) {
+                /* portMAX_DELAY: block on queue indefinitely */
+                t->state = TASK_BLOCKED_QUEUE;
+            } else {
+                /* Timed wait: wakeable by a send, or by the deadline */
+                uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+                if (advance > 200000000ULL) advance = 200000000ULL;
+                t->state = TASK_SLEEPING;
+                t->wake_cycle = cpu->cycle_count + advance;
+            }
+            sched_switch(frt, core_id);
+            pthread_mutex_unlock(&frt->lock);
+            return;
+        }
+        pthread_mutex_unlock(&frt->lock);
+        /* Boot/compatibility calls do not own a schedulable TCB. Any part of
+         * the timeout not consumed by hardware deadlines advances virtually. */
+        if (timeout > 0 && timeout != 0xFFFFFFFFu) {
+            uint64_t remaining = timeout_cycles > hardware_advance ?
+                timeout_cycles - hardware_advance : 0u;
+            cpu->virtual_time_us += remaining / frt->cpu_freq_mhz;
+            xtensa_advance_idle_cycles(cpu, remaining);
+        }
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+
+dequeue_locked:
+    ;
+    /* Dequeue: copy from queue buffer to emulator memory */
+    int offset = q->head * q->item_size;
+    for (int i = 0; i < q->item_size; i++)
+        mem_write8(cpu->mem, buf_ptr + (uint32_t)i, q->buf[offset + i]);
+    if (!peek) {
+        q->head = (q->head + 1) % q->max_items;
+        q->count--;
+        (void)wake_queue_sender_locked(frt, handle);
+    }
+    pthread_mutex_unlock(&frt->lock);
+
+    frt_return(cpu, pdTRUE);
+}
+
+void stub_xQueueReceive(xtensa_cpu_t *cpu, void *ctx) {
+    queue_receive(cpu, ctx, false);
+}
+
+void stub_xQueuePeek(xtensa_cpu_t *cpu, void *ctx) {
+    queue_receive(cpu, ctx, true);
+}
+
+/* ISR queue helpers used by ESP-IDF DMA drivers. Compatibility-mode queues
+ * are host-backed handles, so firmware's native FreeRTOS implementation must
+ * not dereference them as Queue_t objects. These operations are deliberately
+ * nonblocking, matching their FromISR contracts. */
+void stub_xQueueReceiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t buf_ptr = frt_arg(cpu, 1);
+    uint32_t woken_ptr = frt_arg(cpu, 2);
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q || q->count == 0) {
+        pthread_mutex_unlock(&frt->lock);
+        if (woken_ptr)
+            mem_write32(cpu->mem, woken_ptr, pdFALSE);
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+
+    int offset = q->head * q->item_size;
+    for (int i = 0; i < q->item_size; i++)
+        mem_write8(cpu->mem, buf_ptr + (uint32_t)i, q->buf[offset + i]);
+    q->head = (q->head + 1) % q->max_items;
+    q->count--;
+    (void)wake_queue_sender_locked(frt, handle);
+    pthread_mutex_unlock(&frt->lock);
+    if (woken_ptr)
+        mem_write32(cpu->mem, woken_ptr, pdFALSE);
+    frt_return(cpu, pdTRUE);
+}
+
+void stub_xQueueIsQueueFullFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    int full = q && q->count >= q->max_items;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, full ? pdTRUE : pdFALSE);
+}
+
+/* xSemaphoreCreateMutex() -> one-token host-backed queue. */
+void stub_xSemaphoreCreateMutex(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = queue_create_locked(frt, 1, 0, 1, 0);
+    queue_t *q = find_queue(frt, handle);
+    if (q) q->is_mutex = true;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+/* xQueueCreateMutexStatic(type, StaticQueue_t *buffer) uses the supplied
+ * StaticQueue_t as both its allocation and its public handle. Keeping that
+ * identity matters to IDF 5.x's capability-aware semaphore wrappers: their
+ * delete path asks xQueueGenericGetStaticBuffers() for the allocation and
+ * frees it after vQueueDelete(). Treating this constructor like the dynamic
+ * one left the guest looking at Flexe's four-byte bump handle, so the native
+ * accessor rejected it and asserted during otherwise-successful driver
+ * teardown. */
+void stub_xQueueCreateMutexStatic(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t static_queue = frt_arg(cpu, 1);
+    uint32_t handle = 0u;
+    if (static_queue) {
+        pthread_mutex_lock(&frt->lock);
+        handle = queue_create_locked(frt, 1, 0, 1, static_queue);
+        queue_t *q = find_queue(frt, handle);
+        if (q) {
+            q->is_mutex = true;
+            q->is_static = true;
+        }
+        pthread_mutex_unlock(&frt->lock);
+    }
+    frt_return(cpu, handle);
+}
+
+/* ===== Recursive mutexes =====
+ *
+ * xQueueTakeMutexRecursive and xQueueGiveMutexRecursive were not hooked, so
+ * the guest ran FreeRTOS's own versions against a Queue_t Flexe never
+ * populates. The first take appeared to succeed and the second -- the whole
+ * point of a recursive mutex -- failed, which in real firmware is a library
+ * deadlocking on its own re-entrant call.
+ */
+
+void stub_xSemaphoreTake(xtensa_cpu_t *cpu, void *ctx);
+
+/* Owner identity for mutex bookkeeping. Boot and compatibility calls own no
+ * TCB, but they can still take a recursive mutex twice, so they get their own
+ * identity rather than sharing the "unowned" value -- otherwise the second
+ * take does not recognise itself as the holder and blocks on its own lock. */
+#define FRT_BOOT_OWNER 0xFFFFFFFFu
+
+static uint32_t frt_current_task_handle(freertos_stubs_t *frt, int core_id) {
+    if (!frt->scheduler_started || frt->current_task[core_id] < 0)
+        return FRT_BOOT_OWNER;
+    uint32_t h = frt->tasks[frt->current_task[core_id]].handle;
+    return h ? h : FRT_BOOT_OWNER;
+}
+
+/* xSemaphoreTakeRecursive(mutex, ticks) -> xQueueTakeMutexRecursive */
+void stub_xQueueTakeMutexRecursive(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t owner = frt_current_task_handle(frt, cpu->core_id);
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (q && q->mutex_owner == owner) {
+        /* Already ours: re-entry costs nothing and must not block. */
+        q->mutex_depth++;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    if (q && q->count > 0) {
+        q->count--;
+        q->mutex_owner = owner;
+        q->mutex_depth = 1;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    /* Contended, or not one of ours: fall back to the ordinary take, whose
+     * wake path assigns ownership. */
+    stub_xSemaphoreTake(cpu, ctx);
+}
+
+/* xSemaphoreGiveRecursive(mutex) -> xQueueGiveMutexRecursive */
+void stub_xQueueGiveMutexRecursive(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t owner = frt_current_task_handle(frt, cpu->core_id);
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q || q->mutex_owner != owner) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdFALSE);
+        return;
+    }
+    if (q->mutex_depth > 1) {
+        q->mutex_depth--;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    /* Last give: release, and hand the token straight to a waiter if there
+     * is one rather than leaving a surplus. */
+    q->mutex_depth = 0;
+    q->mutex_owner = 0;
+    if (!wake_queue_waiter_locked(frt, handle) && q->count < q->max_items)
+        q->count++;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdTRUE);
+}
+
+/* xSemaphoreCreateBinary() -> empty one-token host-backed queue. */
+void stub_xSemaphoreCreateBinary(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = queue_create_locked(frt, 1, 0, 0, 0);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+/* Native FreeRTOS implements counting-semaphore creation around
+ * xQueueGenericCreate and then mutates Queue_t fields directly. Flexe queue
+ * handles are intentionally host-backed, so intercept the public constructor
+ * as one atomic operation instead. Very large capacities require no storage. */
+void stub_xQueueCreateCountingSemaphore(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t maximum = frt_arg(cpu, 0);
+    uint32_t initial = frt_arg(cpu, 1);
+    uint32_t handle = 0u;
+    if (maximum != 0u && initial <= maximum && initial <= 0x7FFFFFFFu) {
+        pthread_mutex_lock(&frt->lock);
+        handle = queue_create_locked(frt, maximum, 0u, (int)initial, 0u);
+        pthread_mutex_unlock(&frt->lock);
+    }
+    frt_return(cpu, handle);
+}
+
+void stub_xQueueCreateCountingSemaphoreStatic(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t maximum = frt_arg(cpu, 0);
+    uint32_t initial = frt_arg(cpu, 1);
+    uint32_t storage = frt_arg(cpu, 2);
+    uint32_t handle = 0u;
+    if (maximum != 0u && initial <= maximum && initial <= 0x7FFFFFFFu &&
+        storage != 0u) {
+        pthread_mutex_lock(&frt->lock);
+        handle = queue_create_locked(frt, maximum, 0u, (int)initial,
+                                     storage);
+        queue_t *q = find_queue(frt, handle);
+        if (q) q->is_static = true;
+        pthread_mutex_unlock(&frt->lock);
+    }
+    frt_return(cpu, handle);
+}
+
+/* xSemaphoreTake(sem, timeout). A blocking waiter resumes after the give with
+ * pdTRUE already in its saved return register, matching the completed call. */
+void stub_xSemaphoreTake(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t timeout = frt_arg(cpu, 1);
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE); /* retain compatibility for native handles */
+        return;
+    }
+    if (q->count > 0) {
+        q->count--;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    if (timeout != 0 && frt->scheduler_started &&
+        frt->current_task[core_id] >= 0) {
+        /* pdFALSE is the timeout outcome; a give patches it to pdTRUE.
+         * This used to be pre-set to pdTRUE, so a take that timed out
+         * reported that it had acquired the semaphore. */
+        task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+        t->ret_ar_slot = frt_return_slot(cpu);
+        frt_return(cpu, pdFALSE);
+        sched_save_context(frt, core_id);
+        t->blocked_queue = handle;
+        t->q_recv_buf = 0;
+        t->q_waiting = true;
+        t->q_is_semaphore = true;
+        t->q_peek = false;
+        if (timeout == UINT32_MAX) {
+            t->state = TASK_BLOCKED_QUEUE;
+        } else {
+            uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+            if (advance > 200000000ULL) advance = 200000000ULL;
+            t->state = TASK_SLEEPING;
+            t->wake_cycle = cpu->cycle_count + advance;
+        }
+        sched_switch(frt, core_id);
+        pthread_mutex_unlock(&frt->lock);
+        return;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdFALSE);
+}
+
+/* xSemaphoreGive(sem) -> pdTRUE/pdFALSE */
+void stub_xSemaphoreGive(xtensa_cpu_t *cpu, void *ctx) {
+    stub_queue_send(cpu, ctx, 0);
+}
+
+/* xQueueGiveFromISR(queue, woken) is the semaphore-specific ISR give ABI. */
+void stub_xQueueGiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t woken_ptr = frt_arg(cpu, 1);
+    bool woke = false;
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (!q) {
+        pthread_mutex_unlock(&frt->lock);
+        if (woken_ptr) mem_write32(cpu->mem, woken_ptr, pdFALSE);
+        frt_return(cpu, pdTRUE);
+        return;
+    }
+    woke = wake_queue_waiter_locked(frt, handle);
+    bool accepted = woke || q->count < q->max_items;
+    if (!woke && q->count < q->max_items) q->count++;
+    pthread_mutex_unlock(&frt->lock);
+    if (woken_ptr) mem_write32(cpu->mem, woken_ptr, woke ? pdTRUE : pdFALSE);
+    frt_return(cpu, accepted ? pdTRUE : pdFALSE);
+}
+
+static task_tcb_t *find_task(freertos_stubs_t *frt, uint32_t handle,
+                             int *index_out) {
+    for (int index = 0; index < frt->task_count; index++) {
+        task_tcb_t *task = &frt->tasks[index];
+        if (task->state != TASK_UNUSED && task->handle == handle) {
+            if (index_out) *index_out = index;
+            return task;
+        }
+    }
+    return NULL;
+}
+
+static void stub_task_notify_give_from_isr(xtensa_cpu_t *cpu,
+                                           freertos_stubs_t *frt,
+                                           bool generic) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t slot = generic ? frt_arg(cpu, 1) : 0u;
+    uint32_t woken_ptr = frt_arg(cpu, generic ? 2 : 1);
+    bool woke = false;
+
+    pthread_mutex_lock(&frt->lock);
+    int task_index = -1;
+    task_tcb_t *task = slot < FRT_NOTIFY_SLOTS ?
+        find_task(frt, handle, &task_index) : NULL;
+    if (task) {
+        if (task->notify_value[slot] != UINT32_MAX)
+            task->notify_value[slot]++;
+        if (task->notify_waiting && task->notify_wait_index == slot) {
+            uint32_t result = task->notify_value[slot];
+            if (task->notify_clear_on_exit)
+                task->notify_value[slot] = 0u;
+            else if (task->notify_value[slot] != 0u)
+                task->notify_value[slot]--;
+            task->notify_waiting = false;
+            task->ar[task->ret_ar_slot] = result;
+
+            bool is_current = false;
+            for (int core = 0; core < 2; core++) {
+                if (frt->current_task[core] != task_index) continue;
+                is_current = true;
+                if (frt->cpu[core]) {
+                    frt->cpu[core]->running = true;
+                    frt->cpu[core]->halted = false;
+                }
+            }
+            task->state = is_current ? TASK_RUNNING : TASK_READY;
+            woke = true;
+        }
+    }
+    pthread_mutex_unlock(&frt->lock);
+    if (woken_ptr) mem_write32(cpu->mem, woken_ptr, woke ? pdTRUE : pdFALSE);
+    frt_return_void(cpu);
+}
+
+/* FreeRTOS task-notification give/take APIs used by ESP-IDF's EMAC RX task.
+ * IDF 4.x links the generic indexed symbols even when only slot zero exists. */
+void stub_vTaskGenericNotifyGiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    stub_task_notify_give_from_isr(cpu, ctx, true);
+}
+
+void stub_vTaskNotifyGiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    stub_task_notify_give_from_isr(cpu, ctx, false);
+}
+
+static void stub_task_notify_take(xtensa_cpu_t *cpu,
+                                  freertos_stubs_t *frt,
+                                  bool generic) {
+    uint32_t slot = generic ? frt_arg(cpu, 0) : 0u;
+    bool clear_on_exit = frt_arg(cpu, generic ? 1 : 0) != 0u;
+    uint32_t timeout = frt_arg(cpu, generic ? 2 : 1);
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+    task_tcb_t *task = NULL;
+    if (slot < FRT_NOTIFY_SLOTS && frt->scheduler_started &&
+        frt->current_task[core_id] >= 0)
+        task = &frt->tasks[frt->current_task[core_id]];
+    if (task && task->notify_value[slot] != 0u) {
+        uint32_t result = task->notify_value[slot];
+        if (clear_on_exit) task->notify_value[slot] = 0u;
+        else task->notify_value[slot]--;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, result);
+        return;
+    }
+    if (!task || timeout == 0u) {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, 0u);
+        return;
+    }
+
+    /* Resume after the call when a give arrives; the ISR patches the saved
+     * return register with the notification count before waking this TCB. */
+    task->ret_ar_slot = frt_return_slot(cpu);
+    frt_return(cpu, 0u);
+    sched_save_context(frt, core_id);
+    task->notify_wait_index = (uint8_t)slot;
+    task->notify_waiting = true;
+    task->notify_clear_on_exit = clear_on_exit;
+    if (timeout == UINT32_MAX) {
+        task->state = TASK_BLOCKED_NOTIFY;
+    } else {
+        uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+        if (advance > 200000000ULL) advance = 200000000ULL;
+        task->state = TASK_SLEEPING;
+        task->wake_cycle = cpu->cycle_count + advance;
+    }
+    sched_switch(frt, core_id);
+    pthread_mutex_unlock(&frt->lock);
+}
+
+void stub_ulTaskGenericNotifyTake(xtensa_cpu_t *cpu, void *ctx) {
+    stub_task_notify_take(cpu, ctx, true);
+}
+
+void stub_ulTaskNotifyTake(xtensa_cpu_t *cpu, void *ctx) {
+    stub_task_notify_take(cpu, ctx, false);
+}
+
+/* pvPortMalloc(size) -> bump-allocated address */
+void stub_pvPortMalloc(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t size = frt_arg(cpu, 0);
+    pthread_mutex_lock(&frt->lock);
+    uint32_t ptr = bump_alloc(frt, size);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, ptr);
+}
+
+/* vPortFree(ptr) — no-op */
+void stub_vPortFree(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return_void(cpu);
+}
+
+/* xTaskGetCurrentTaskHandle() -> current task handle or fixed fake */
+void stub_xTaskGetCurrentTaskHandle(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    int core_id = cpu->core_id;
+    pthread_mutex_lock(&frt->lock);
+    if (frt->scheduler_started && frt->current_task[core_id] >= 0) {
+        uint32_t h = frt->tasks[frt->current_task[core_id]].handle;
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, h);
+    } else {
+        pthread_mutex_unlock(&frt->lock);
+        frt_return(cpu, 0x3FFF0100u); /* fixed fake handle */
+    }
+}
+
+/* vTaskSuspend(handle) — mark task UNUSED and switch */
+/* vTaskSuspend(handle), where a null handle means the calling task.
+ *
+ * This used to ignore the argument entirely and always suspend the caller, so
+ * parking a worker from another task parked the wrong one -- and it marked the
+ * TCB TASK_UNUSED, which is the free-slot state, so the task could never be
+ * resumed and its slot could be handed to the next xTaskCreate. */
+void stub_vTaskSuspend(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    int core_id = cpu->core_id;
+    uint32_t handle = frt_arg(cpu, 0);
+
+    pthread_mutex_lock(&frt->lock);
+    if (!frt->scheduler_started || frt->current_task[core_id] < 0) {
+        pthread_mutex_unlock(&frt->lock);
+        cpu->running = false;
+        return;
+    }
+
+    int target = frt->current_task[core_id];
+    if (handle != 0) {
+        int index = -1;
+        if (find_task(frt, handle, &index)) target = index;
+    }
+
+    if (target == frt->current_task[core_id]) {
+        /* Suspending ourselves: unwind the call, park, and switch away. */
+        frt_return_void(cpu);
+        sched_save_context(frt, core_id);
+        frt->tasks[target].state = TASK_SUSPENDED;
+        sched_switch(frt, core_id);
+        pthread_mutex_unlock(&frt->lock);
+        return;
+    }
+
+    /* Suspending someone else: it keeps its saved context and simply stops
+     * being picked. Any wait it was in is abandoned, as on hardware. */
+    frt->tasks[target].state = TASK_SUSPENDED;
+    frt->tasks[target].q_waiting = false;
+    frt->tasks[target].eg_waiting = false;
+    frt->tasks[target].notify_waiting = false;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return_void(cpu);
+}
+
+/* vTaskResume(handle) / vTaskResumeFromISR(handle). Not hooked before, so a
+ * suspended task stayed suspended for good. */
+static void frt_resume_task(xtensa_cpu_t *cpu, void *ctx, bool from_isr) {
+    freertos_stubs_t *frt = ctx;
+    bool woke = false;
+    pthread_mutex_lock(&frt->lock);
+    int index = -1;
+    task_tcb_t *t = find_task(frt, frt_arg(cpu, 0), &index);
+    if (t && t->state == TASK_SUSPENDED) {
+        t->state = TASK_READY;
+        woke = true;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    if (from_isr) frt_return(cpu, woke ? pdTRUE : pdFALSE);
+    else frt_return_void(cpu);
+}
+
+void stub_vTaskResume(xtensa_cpu_t *cpu, void *ctx) {
+    frt_resume_task(cpu, ctx, false);
+}
+
+void stub_vTaskResumeFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    frt_resume_task(cpu, ctx, true);
+}
+
+/* uxTaskGetStackHighWaterMark() -> return a comfortable margin */
+void stub_uxTaskGetStackHighWaterMark(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return(cpu, 2048);
+}
+
+/* uxTaskGetNumberOfTasks() -> number of tracked tasks. */
+static void stub_uxTaskGetNumberOfTasks(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t n = 0;
+    for (int i = 0; i < frt->task_count; i++)
+        if (frt->tasks[i].state != TASK_UNUSED) n++;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, n);
+}
+
+/* uxTaskGetSystemState(TaskStatus_t *arr, UBaseType_t size, uint32_t *total_run_time)
+ *   ESP32 TaskStatus_t layout (40 bytes, configTASKLIST_INCLUDE_COREID=1, portSTACK_GROWTH<0):
+ *     0x00 xHandle, 0x04 pcTaskName, 0x08 xTaskNumber, 0x0C eCurrentState,
+ *     0x10 uxCurrentPriority, 0x14 uxBasePriority, 0x18 ulRunTimeCounter,
+ *     0x1C pxStackBase, 0x20 usStackHighWaterMark, 0x24 xCoreID.
+ *   Returns number of tasks written. */
+static void stub_uxTaskGetSystemState(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t arr_ptr     = frt_arg(cpu, 0);
+    uint32_t max_tasks   = frt_arg(cpu, 1);
+    uint32_t total_ptr   = frt_arg(cpu, 2);
+
+    pthread_mutex_lock(&frt->lock);
+    /* Realize in-flight time on both cores so cumulative_cycles reflects
+     * work done since the task's last switch-in, without waiting for a
+     * context-switch to actually credit it. */
+    for (int c = 0; c < 2; c++) {
+        if (!frt->cpu[c]) continue;
+        int cur = frt->current_task[c];
+        if (cur < 0) continue;
+        uint64_t now = frt->cpu[c]->cycle_count;
+        if (now >= frt->last_switch_cycle[c]) {
+            frt->tasks[cur].cumulative_cycles += now - frt->last_switch_cycle[c];
+            frt->last_switch_cycle[c] = now;
+        }
+    }
+
+    uint32_t written = 0;
+    /* Name pool: small region in PSRAM reused to store task-name strings
+     * so TaskStatus_t.pcTaskName points somewhere guest-readable. */
+    uint32_t name_pool = 0x3FB80000u;
+    for (int i = 0; i < frt->task_count && written < max_tasks; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (t->state == TASK_UNUSED) continue;
+
+        uint64_t run_cycles = t->cumulative_cycles;
+
+        /* Copy task name into guest memory (name pool entry = 16 bytes). */
+        uint32_t name_addr = name_pool + (uint32_t)i * 16;
+        for (int k = 0; k < 15; k++)
+            mem_write8(cpu->mem, name_addr + (uint32_t)k, (uint8_t)t->name[k]);
+        mem_write8(cpu->mem, name_addr + 15, 0);
+
+        uint32_t base = arr_ptr + written * 40u;
+        mem_write32(cpu->mem, base + 0x00, t->handle);
+        mem_write32(cpu->mem, base + 0x04, name_addr);
+        mem_write32(cpu->mem, base + 0x08, (uint32_t)i + 1);
+        /* eTaskState: 0=Running, 1=Ready, 2=Blocked, 3=Suspended, 4=Deleted */
+        uint32_t estate = 1;
+        switch (t->state) {
+            case TASK_RUNNING:       estate = 0; break;
+            case TASK_READY:         estate = 1; break;
+            case TASK_BLOCKED_QUEUE: estate = 2; break;
+            case TASK_BLOCKED_NOTIFY: estate = 2; break;
+            case TASK_BLOCKED_EVENTGROUP: estate = 2; break;
+            case TASK_SUSPENDED:     estate = 3; break;
+            case TASK_SLEEPING:      estate = 2; break;
+            case TASK_UNUSED:        estate = 4; break;
+            default:                 estate = 1; break;
+        }
+        mem_write32(cpu->mem, base + 0x0C, estate);
+        mem_write32(cpu->mem, base + 0x10, t->priority);
+        mem_write32(cpu->mem, base + 0x14, t->priority);
+        /* Scale by 256 so real_time_stats's (task_elapsed * 100) multiply
+         * doesn't overflow uint32_t when tasks have accumulated hundreds
+         * of millions of cycles of wall-time credit. */
+        mem_write32(cpu->mem, base + 0x18, (uint32_t)(run_cycles >> 8));
+        mem_write32(cpu->mem, base + 0x1C, t->stack_top - TASK_STACK_SIZE);
+        mem_write32(cpu->mem, base + 0x20, 2048);  /* usStackHighWaterMark */
+        /* xCoreID: -1 for no affinity (per ESP-IDF tskNO_AFFINITY) */
+        int32_t core_id = (t->core_affinity < 0) ? -1 : t->core_affinity;
+        mem_write32(cpu->mem, base + 0x24, (uint32_t)core_id);
+        written++;
+    }
+
+    /* Total run time: sum_of_task_cycles / cores. The example computes
+     *   percentage = (task * 100) / (total * cores)
+     * so with total = sum/cores, percentages collapse to task/sum*100 —
+     * each task's share of total task work. Six equal tasks → ~16% each. */
+    if (total_ptr) {
+        uint64_t sum = 0;
+        for (int i = 0; i < frt->task_count; i++) {
+            task_tcb_t *t = &frt->tasks[i];
+            if (t->state == TASK_UNUSED) continue;
+            sum += t->cumulative_cycles;
+        }
+        uint64_t total = (sum / 2) >> 8;  /* match per-task scaling */
+        if (total == 0) total = 1; /* example bails on total==0 */
+        mem_write32(cpu->mem, total_ptr, (uint32_t)total);
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, written);
+}
+
+/* disableCore0WDT / disableCore1WDT — no-op in emulator */
+static void stub_disableCoreWDT(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return_void(cpu);
+}
+
+/* xTaskGetIdleTaskHandleForCPU(cpu) -> fake handle */
+static void stub_xTaskGetIdleTaskHandleForCPU(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return(cpu, 0x3FFF0200u);
+}
+
+/* xPortEnterCriticalTimeout / vPortExitCritical — no-op */
+static void stub_xPortEnterCriticalTimeout(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return_void(cpu);
+}
+
+/* A FromISR give already made the compatibility task runnable and resumed
+ * its saved idle context. Do not enter the firmware's native scheduler with
+ * host-owned task state. */
+static void stub_vPortEvaluateYieldFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return_void(cpu);
+}
+
+/* xTaskGetSchedulerState() -> taskSCHEDULER_RUNNING (2) */
+static void stub_xTaskGetSchedulerState(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return(cpu, 2);
+}
+
+/* ESP-IDF IPC calls and cross-core DPORT stalls are unnecessary in the
+ * compatibility scheduler: both virtual cores execute serially against one
+ * coherent memory map.  More importantly, the real IPC ISR task is replaced
+ * along with FreeRTOS, so letting stall_pause()/stall_resume() run around
+ * light sleep can enable a release without a matching stall and underflow
+ * IDF's per-core nesting count. */
+static void stub_esp_ipc_noop(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return(cpu, 0);
+}
+
+/* vTaskStartScheduler — start cooperative scheduler, never returns */
+static void stub_vTaskStartScheduler(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    (void)cpu;
+    pthread_mutex_lock(&frt->lock);
+    sched_start(frt);
+    pthread_mutex_unlock(&frt->lock);
+    /* sched_start jumps to first task via sched_restore_context,
+     * so we never return to the caller's j-self loop. */
+}
+
+/* vPortYield / vTaskSwitchContext — yield to scheduler */
+static void stub_vPortYield(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    int core_id = cpu->core_id;
+    pthread_mutex_lock(&frt->lock);
+    if (frt->scheduler_started && frt->current_task[core_id] >= 0) {
+        frt_return_void(cpu);
+        sched_save_context(frt, core_id);
+        frt->tasks[frt->current_task[core_id]].state = TASK_READY;
+        sched_switch(frt, core_id);
+    } else {
+        frt_return_void(cpu);
+    }
+    pthread_mutex_unlock(&frt->lock);
+}
+
+/* xQueueGenericCreate (underlying implementation xQueueCreate may alias) */
+void stub_xQueueGenericCreate(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t length = frt_arg(cpu, 0);
+    uint32_t item_size = frt_arg(cpu, 1);
+    uint32_t queue_type = frt_arg(cpu, 2);
+    int initial_count = item_size == 0 &&
+        (queue_type == 1u || queue_type == 4u) ? 1 : 0;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = queue_create_locked(frt, length, item_size,
+                                          initial_count, 0);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+/* Static queues use the caller-provided StaticQueue_t address as their
+ * stable handle while storage and synchronization remain host-backed. */
+void stub_xQueueGenericCreateStatic(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t length = frt_arg(cpu, 0);
+    uint32_t item_size = frt_arg(cpu, 1);
+    uint32_t static_queue = frt_arg(cpu, 3);
+    uint32_t queue_type = frt_arg(cpu, 4);
+    int initial_count = item_size == 0 &&
+        (queue_type == 1u || queue_type == 4u) ? 1 : 0;
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = queue_create_locked(frt, length, item_size,
+                                          initial_count, static_queue);
+    queue_t *q = find_queue(frt, handle);
+    if (q) {
+        q->is_static = true;
+        q->static_storage = frt_arg(cpu, 2);
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+/* Report the caller-owned buffers behind a statically-created queue. This is
+ * a public FreeRTOS accessor in newer IDF releases and is used by
+ * vSemaphoreDeleteWithCaps() before freeing the StaticQueue_t allocation. */
+void stub_xQueueGenericGetStaticBuffers(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t storage_out = frt_arg(cpu, 1);
+    uint32_t queue_out = frt_arg(cpu, 2);
+    uint32_t static_storage = 0u;
+    bool is_static = false;
+
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (q && q->is_static) {
+        is_static = true;
+        static_storage = q->static_storage;
+    }
+    pthread_mutex_unlock(&frt->lock);
+
+    if (is_static) {
+        if (storage_out) mem_write32(cpu->mem, storage_out, static_storage);
+        if (queue_out) mem_write32(cpu->mem, queue_out, handle);
+    }
+    frt_return(cpu, is_static ? pdTRUE : pdFALSE);
+}
+
+/* ===== ESP-IDF ring buffers =====
+ *
+ * Payloads remain in guest RAM so a pointer returned by Receive is directly
+ * usable by unmodified firmware. Metadata and scheduling stay host-backed,
+ * matching the rest of the compatibility FreeRTOS implementation. Data is
+ * kept compacted at the start of the guest allocation; ReturnItem removes the
+ * borrowed prefix. This preserves byte-stream and item boundaries without
+ * exposing ESP-IDF's private Ringbuffer_t layout to either side. */
+
+static ringbuffer_t *find_ringbuffer(freertos_stubs_t *frt,
+                                     uint32_t handle) {
+    for (int i = 0; i < frt->ringbuffer_count; i++)
+        if (frt->ringbuffers[i].handle == handle && handle != 0u)
+            return &frt->ringbuffers[i];
+    return NULL;
+}
+
+static uint32_t ringbuffer_create_locked(xtensa_cpu_t *cpu,
+                                         freertos_stubs_t *frt,
+                                         uint32_t capacity, uint32_t type,
+                                         uint32_t storage,
+                                         uint32_t static_control,
+                                         uint32_t caps) {
+    if (capacity == 0u || type > RINGBUF_TYPE_BYTEBUF)
+        return 0u;
+
+    int slot = -1;
+    for (int i = 0; i < frt->ringbuffer_count; i++) {
+        if (static_control &&
+            frt->ringbuffers[i].handle == static_control)
+            return static_control;
+        if (slot < 0 && frt->ringbuffers[i].handle == 0u)
+            slot = i;
+    }
+    if (slot < 0) {
+        if (frt->ringbuffer_count >= MAX_RINGBUFFERS) return 0u;
+        slot = frt->ringbuffer_count++;
+    }
+
+    bool owns_storage = storage == 0u;
+    esp32_rom_stubs_t *rom = frt->rom;
+    if (!rom) rom = cpu->pc_hook_ctx;
+    if (owns_storage)
+        storage = rom_stubs_heap_alloc_caps(rom, capacity, caps);
+    if (!storage) return 0u;
+
+    uint32_t handle = static_control ? static_control : bump_alloc(frt, 4u);
+    if (!handle) {
+        if (owns_storage) rom_stubs_heap_free(rom, storage);
+        return 0u;
+    }
+
+    ringbuffer_t *rb = &frt->ringbuffers[slot];
+    memset(rb, 0, sizeof(*rb));
+    rb->handle = handle;
+    rb->storage = storage;
+    rb->static_control = static_control;
+    rb->capacity = capacity;
+    rb->type = (uint8_t)type;
+    rb->owns_storage = owns_storage;
+    return handle;
+}
+
+static void stub_ringbuffer_create(xtensa_cpu_t *cpu,
+                                   freertos_stubs_t *frt,
+                                   uint32_t capacity, uint32_t type,
+                                   uint32_t storage,
+                                   uint32_t static_control,
+                                   uint32_t caps) {
+    pthread_mutex_lock(&frt->lock);
+    uint32_t handle = ringbuffer_create_locked(cpu, frt, capacity, type,
+                                                storage, static_control, caps);
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, handle);
+}
+
+void stub_xRingbufferCreate(xtensa_cpu_t *cpu, void *ctx) {
+    stub_ringbuffer_create(cpu, ctx, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                           0u, 0u, 0u);
+}
+
+void stub_xRingbufferCreateWithCaps(xtensa_cpu_t *cpu, void *ctx) {
+    stub_ringbuffer_create(cpu, ctx, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                           0u, 0u, frt_arg(cpu, 2));
+}
+
+void stub_xRingbufferCreateStatic(xtensa_cpu_t *cpu, void *ctx) {
+    stub_ringbuffer_create(cpu, ctx, frt_arg(cpu, 0), frt_arg(cpu, 1),
+                           frt_arg(cpu, 2), frt_arg(cpu, 3), 0u);
+}
+
+void stub_xRingbufferCreateNoSplit(xtensa_cpu_t *cpu, void *ctx) {
+    uint32_t item_size = frt_arg(cpu, 0);
+    uint32_t item_count = frt_arg(cpu, 1);
+    uint32_t capacity = 0u;
+    if (item_size <= UINT32_MAX - 3u && item_count != 0u) {
+        uint32_t aligned = (item_size + 3u) & ~3u;
+        uint64_t total = ((uint64_t)aligned + 8u) * item_count;
+        if (total <= UINT32_MAX) capacity = (uint32_t)total;
+    }
+    stub_ringbuffer_create(cpu, ctx, capacity, RINGBUF_TYPE_NOSPLIT,
+                           0u, 0u, 0u);
+}
+
+static bool ringbuffer_append_locked(xtensa_cpu_t *cpu, ringbuffer_t *rb,
+                                     uint32_t item, uint32_t size) {
+    if (!rb || rb->used > rb->capacity || rb->acquired ||
+        size > rb->capacity - rb->used ||
+        (size != 0u && item == 0u))
+        return false;
+    if (rb->type != RINGBUF_TYPE_BYTEBUF &&
+        rb->item_count >= MAX_RINGBUFFER_ITEMS)
+        return false;
+
+    for (uint32_t i = 0; i < size; i++)
+        mem_write8(cpu->mem, rb->storage + rb->used + i,
+                   mem_read8(cpu->mem, item + i));
+    rb->used += size;
+    if (rb->type != RINGBUF_TYPE_BYTEBUF)
+        rb->item_len[rb->item_count++] = size;
+    return true;
+}
+
+static uint32_t ringbuffer_borrow_locked(ringbuffer_t *rb,
+                                         uint32_t max_size,
+                                         uint32_t *size_out) {
+    if (!rb || rb->borrowed || max_size == 0u)
+        return 0u;
+
+    uint32_t size;
+    if (rb->type == RINGBUF_TYPE_BYTEBUF) {
+        if (rb->used == 0u) return 0u;
+        size = rb->used < max_size ? rb->used : max_size;
+    } else {
+        if (rb->item_count == 0u) return 0u;
+        size = rb->item_len[0];
+    }
+
+    rb->borrowed = true;
+    rb->borrowed_len = size;
+    if (size_out) *size_out = size;
+    return rb->storage;
+}
+
+static bool wake_ringbuffer_waiter_locked(freertos_stubs_t *frt,
+                                           ringbuffer_t *rb) {
+    if (!frt->scheduler_started || !frt->cpu[0] || !rb) return false;
+    for (int i = 0; i < frt->task_count; i++) {
+        task_tcb_t *t = &frt->tasks[i];
+        if (!t->rb_waiting || t->rb_handle != rb->handle) continue;
+
+        uint32_t size = 0u;
+        uint32_t item = ringbuffer_borrow_locked(rb, t->rb_max_size, &size);
+        if (!item) return false;
+        if (t->rb_size_out)
+            mem_write32(frt->cpu[0]->mem, t->rb_size_out, size);
+        t->ar[t->ret_ar_slot] = item;
+        t->rb_waiting = false;
+        t->rb_handle = 0u;
+
+        bool is_current = false;
+        for (int core = 0; core < 2; core++) {
+            if (frt->current_task[core] != i) continue;
+            is_current = true;
+            if (frt->cpu[core]) {
+                frt->cpu[core]->running = true;
+                frt->cpu[core]->halted = false;
+            }
+        }
+        t->state = is_current ? TASK_RUNNING : TASK_READY;
+        return true;
+    }
+    return false;
+}
+
+static void ringbuffer_send(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                            bool from_isr) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item = frt_arg(cpu, 1);
+    uint32_t size = frt_arg(cpu, 2);
+    uint32_t woken_out = from_isr ? frt_arg(cpu, 3) : 0u;
+
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    bool sent = ringbuffer_append_locked(cpu, rb, item, size);
+    bool woke = sent && wake_ringbuffer_waiter_locked(frt, rb);
+    pthread_mutex_unlock(&frt->lock);
+
+    /* FreeRTOS FromISR APIs accumulate this flag across several operations
+     * in one ISR, so a non-waking send must not clear an earlier pdTRUE. */
+    if (woken_out && woke) mem_write32(cpu->mem, woken_out, pdTRUE);
+    frt_return(cpu, sent ? pdTRUE : pdFALSE);
+}
+
+void stub_xRingbufferSend(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_send(cpu, ctx, false);
+}
+
+void stub_xRingbufferSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_send(cpu, ctx, true);
+}
+
+static void ringbuffer_receive(xtensa_cpu_t *cpu, freertos_stubs_t *frt,
+                               bool from_isr, bool up_to) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t size_out = frt_arg(cpu, 1);
+    uint32_t timeout = from_isr ? 0u : frt_arg(cpu, 2);
+    uint32_t max_size = up_to ? frt_arg(cpu, from_isr ? 2 : 3)
+                              : UINT32_MAX;
+    int core_id = cpu->core_id;
+    if (!from_isr && timeout != 0u)
+        frt_refresh_cpu_frequency(frt, cpu);
+
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    uint32_t size = 0u;
+    uint32_t item = ringbuffer_borrow_locked(rb, max_size, &size);
+    if (item) {
+        pthread_mutex_unlock(&frt->lock);
+        if (size_out) mem_write32(cpu->mem, size_out, size);
+        frt_return(cpu, item);
+        return;
+    }
+
+    if (!from_isr && timeout != 0u && rb && !rb->borrowed &&
+        frt->scheduler_started && frt->current_task[core_id] >= 0) {
+        task_tcb_t *t = &frt->tasks[frt->current_task[core_id]];
+        t->ret_ar_slot = frt_return_slot(cpu);
+        frt_return(cpu, 0u);
+        sched_save_context(frt, core_id);
+        t->rb_handle = handle;
+        t->rb_size_out = size_out;
+        t->rb_max_size = max_size;
+        t->rb_waiting = true;
+        if (timeout == UINT32_MAX) {
+            t->state = TASK_BLOCKED_QUEUE;
+        } else {
+            uint64_t advance = frt_ticks_to_cycles(frt, cpu, timeout);
+            if (advance > 200000000ULL) advance = 200000000ULL;
+            t->state = TASK_SLEEPING;
+            t->wake_cycle = cpu->cycle_count + advance;
+        }
+        sched_switch(frt, core_id);
+        pthread_mutex_unlock(&frt->lock);
+        return;
+    }
+
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, 0u);
+}
+
+void stub_xRingbufferReceive(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive(cpu, ctx, false, false);
+}
+
+void stub_xRingbufferReceiveFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive(cpu, ctx, true, false);
+}
+
+void stub_xRingbufferReceiveUpTo(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive(cpu, ctx, false, true);
+}
+
+void stub_xRingbufferReceiveUpToFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive(cpu, ctx, true, true);
+}
+
+static void ringbuffer_return_item(xtensa_cpu_t *cpu,
+                                   freertos_stubs_t *frt,
+                                   uint32_t woken_out) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item = frt_arg(cpu, 1);
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    if (rb && rb->borrowed && rb->borrowed_len <= rb->used &&
+        item == rb->storage) {
+        uint32_t consumed = rb->borrowed_len;
+        uint32_t remaining = rb->used - consumed;
+        for (uint32_t i = 0; i < remaining; i++)
+            mem_write8(cpu->mem, rb->storage + i,
+                       mem_read8(cpu->mem, rb->storage + consumed + i));
+        rb->used = remaining;
+        if (rb->type != RINGBUF_TYPE_BYTEBUF && rb->item_count != 0u) {
+            for (unsigned i = 1; i < rb->item_count; i++)
+                rb->item_len[i - 1] = rb->item_len[i];
+            rb->item_count--;
+        }
+        rb->borrowed = false;
+        rb->borrowed_len = 0u;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    /* No blocked-send model is needed yet, so this call cannot newly request
+     * a yield. Preserve any pdTRUE already accumulated by the ISR. */
+    (void)woken_out;
+    frt_return_void(cpu);
+}
+
+void stub_vRingbufferReturnItem(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_return_item(cpu, ctx, 0u);
+}
+
+void stub_vRingbufferReturnItemFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_return_item(cpu, ctx, frt_arg(cpu, 2));
+}
+
+void stub_xRingbufferSendAcquire(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item_out = frt_arg(cpu, 1);
+    uint32_t size = frt_arg(cpu, 2);
+    uint32_t item = 0u;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    if (rb && rb->used <= rb->capacity &&
+        rb->type == RINGBUF_TYPE_NOSPLIT && !rb->acquired &&
+        !rb->borrowed && size <= rb->capacity - rb->used &&
+        rb->item_count < MAX_RINGBUFFER_ITEMS) {
+        item = rb->storage + rb->used;
+        rb->acquired = true;
+        rb->acquired_len = size;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    if (item_out) mem_write32(cpu->mem, item_out, item);
+    frt_return(cpu, item ? pdTRUE : pdFALSE);
+}
+
+void stub_xRingbufferSendComplete(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t item = frt_arg(cpu, 1);
+    bool sent = false;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    if (rb && rb->acquired && item == rb->storage + rb->used) {
+        rb->used += rb->acquired_len;
+        rb->item_len[rb->item_count++] = rb->acquired_len;
+        rb->acquired = false;
+        rb->acquired_len = 0u;
+        sent = true;
+        (void)wake_ringbuffer_waiter_locked(frt, rb);
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, sent ? pdTRUE : pdFALSE);
+}
+
+static void ringbuffer_receive_split(xtensa_cpu_t *cpu,
+                                     freertos_stubs_t *frt) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t head_out = frt_arg(cpu, 1);
+    uint32_t tail_out = frt_arg(cpu, 2);
+    uint32_t head_size_out = frt_arg(cpu, 3);
+    uint32_t tail_size_out = frt_arg(cpu, 4);
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    uint32_t size = 0u;
+    uint32_t item = ringbuffer_borrow_locked(rb, UINT32_MAX, &size);
+    pthread_mutex_unlock(&frt->lock);
+    if (head_out) mem_write32(cpu->mem, head_out, item);
+    if (tail_out) mem_write32(cpu->mem, tail_out, 0u);
+    if (item && head_size_out) mem_write32(cpu->mem, head_size_out, size);
+    if (tail_size_out) mem_write32(cpu->mem, tail_size_out, 0u);
+    frt_return(cpu, item ? pdTRUE : pdFALSE);
+}
+
+void stub_xRingbufferReceiveSplit(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive_split(cpu, ctx);
+}
+
+void stub_xRingbufferReceiveSplitFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_receive_split(cpu, ctx);
+}
+
+static void ringbuffer_delete(xtensa_cpu_t *cpu, freertos_stubs_t *frt) {
+    uint32_t handle = frt_arg(cpu, 0);
+    uint32_t storage = 0u;
+    bool owns_storage = false;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, handle);
+    if (rb) {
+        storage = rb->storage;
+        owns_storage = rb->owns_storage;
+        memset(rb, 0, sizeof(*rb));
+    }
+    pthread_mutex_unlock(&frt->lock);
+    esp32_rom_stubs_t *rom = frt->rom;
+    if (!rom) rom = cpu->pc_hook_ctx;
+    if (owns_storage) rom_stubs_heap_free(rom, storage);
+    frt_return_void(cpu);
+}
+
+void stub_vRingbufferDelete(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_delete(cpu, ctx);
+}
+
+void stub_vRingbufferDeleteWithCaps(xtensa_cpu_t *cpu, void *ctx) {
+    ringbuffer_delete(cpu, ctx);
+}
+
+void stub_xRingbufferGetMaxItemSize(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, frt_arg(cpu, 0));
+    uint32_t size = rb ? rb->capacity : 0u;
+    if (rb && rb->type == RINGBUF_TYPE_NOSPLIT)
+        size = rb->capacity > 16u ? rb->capacity / 2u - 8u : 0u;
+    else if (rb && rb->type == RINGBUF_TYPE_ALLOWSPLIT)
+        size = rb->capacity > 8u ? rb->capacity - 8u : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, size);
+}
+
+void stub_xRingbufferGetCurFreeSize(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, frt_arg(cpu, 0));
+    uint32_t size = rb && rb->used <= rb->capacity &&
+                    rb->acquired_len <= rb->capacity - rb->used
+                  ? rb->capacity - rb->used - rb->acquired_len : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, size);
+}
+
+void stub_xRingbufferGetStaticBuffer(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t storage_out = frt_arg(cpu, 1);
+    uint32_t control_out = frt_arg(cpu, 2);
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, frt_arg(cpu, 0));
+    bool is_static = rb && rb->static_control != 0u;
+    uint32_t storage = is_static ? rb->storage : 0u;
+    uint32_t control = is_static ? rb->static_control : 0u;
+    pthread_mutex_unlock(&frt->lock);
+    if (is_static) {
+        if (storage_out) mem_write32(cpu->mem, storage_out, storage);
+        if (control_out) mem_write32(cpu->mem, control_out, control);
+    }
+    frt_return(cpu, is_static ? pdTRUE : pdFALSE);
+}
+
+void stub_vRingbufferGetInfo(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t out[5];
+    for (unsigned i = 0; i < 5; i++) out[i] = frt_arg(cpu, (int)i + 1);
+    pthread_mutex_lock(&frt->lock);
+    ringbuffer_t *rb = find_ringbuffer(frt, frt_arg(cpu, 0));
+    uint32_t values[5] = {0};
+    if (rb) {
+        values[0] = rb->used;
+        values[1] = 0u;
+        values[2] = rb->used;
+        values[3] = rb->used + rb->acquired_len;
+        values[4] = rb->type == RINGBUF_TYPE_BYTEBUF ? rb->used
+                                                     : rb->item_count;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    for (unsigned i = 0; i < 5; i++)
+        if (out[i]) mem_write32(cpu->mem, out[i], values[i]);
+    frt_return_void(cpu);
+}
+
+void stub_xRingbufferQueueSetNoop(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    bool valid = find_ringbuffer(frt, frt_arg(cpu, 0)) != NULL;
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, valid ? pdTRUE : pdFALSE);
+}
+
+void stub_xRingbufferPrintInfo(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return_void(cpu);
+}
+
+/* xQueueGenericSend (underlying implementation) */
+void stub_xQueueGenericSend(xtensa_cpu_t *cpu, void *ctx) {
+    stub_queue_send(cpu, ctx, frt_arg(cpu, 3));
+}
+
+/* xQueueGenericSendFromISR */
+void stub_xQueueGenericSendFromISR(xtensa_cpu_t *cpu, void *ctx) {
+    stub_queue_send(cpu, ctx, frt_arg(cpu, 3));
+}
+
+/* xQueueGenericReset(queue, new_queue) empties a queue. */
+void stub_xQueueGenericReset(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (q) {
+        q->count = 0;
+        q->head = 0;
+        q->tail = 0;
+    }
+    pthread_mutex_unlock(&frt->lock);
+    frt_return(cpu, pdTRUE);
+}
+
+void stub_vQueueDelete(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    uint32_t handle = frt_arg(cpu, 0);
+    pthread_mutex_lock(&frt->lock);
+    queue_t *q = find_queue(frt, handle);
+    if (q) memset(q, 0, sizeof(*q));
+    pthread_mutex_unlock(&frt->lock);
+    frt_return_void(cpu);
+}
+
+/* xPortGetCoreID() -> cpu->core_id */
+static void stub_xPortGetCoreID(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    frt_return(cpu, (uint32_t)cpu->core_id);
+}
+
+/* esp_startup_start_app_other_cores — start core 1's scheduler portion.
+ * Called by core 1's startup code after init. Picks first task for core 1.
+ *
+ * IMPORTANT: the real function never returns (it enters xPortStartScheduler's
+ * idle loop).  If we return via frt_return_void when no task is available,
+ * core 1 resumes executing the literal pool right after the call site, which
+ * crashes with PC=0 once the garbage bytes rotate the register window.
+ *
+ * When no task is ready yet, we park core 1 by halting it (running=false);
+ * the session post_batch loop re-checks via check_preempt_core and resumes
+ * core 1 as soon as a task becomes eligible for it. */
+static void stub_esp_startup_start_app_other_cores(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    int core_id = cpu->core_id;
+
+    pthread_mutex_lock(&frt->lock);
+
+    /* Pick first task for this core */
+    int next = sched_pick_next(frt, core_id);
+    if (next >= 0) {
+        frt->current_task[core_id] = next;
+        frt->tasks[next].state = TASK_RUNNING;
+        frt->last_switch_cycle[core_id] = cpu->cycle_count;
+        sched_restore_context(frt, core_id);
+    } else {
+        /* Park: halt core 1 and leave PC at the stub entry so re-entry here
+         * is a no-op once we're resumed.  check_preempt_core will wake us. */
+        cpu->running = false;
+    }
+    pthread_mutex_unlock(&frt->lock);
+}
+
+/* ===== Preemptive timeslice check ===== */
+
+bool freertos_stubs_check_preempt_core(freertos_stubs_t *frt, int core_id) {
+    if (!frt || !frt->cpu[core_id]) return false;
+
+    pthread_mutex_lock(&frt->lock);
+    if (!frt->scheduler_started) {
+        pthread_mutex_unlock(&frt->lock);
+        return false;
+    }
+    /* Core has no current task — try to pick up a newly created one */
+    if (frt->current_task[core_id] < 0) {
+        int next = sched_pick_next(frt, core_id);
+        if (next >= 0) {
+            frt->current_task[core_id] = next;
+            frt->tasks[next].state = TASK_RUNNING;
+            frt->last_switch_cycle[core_id] = frt->cpu[core_id]->cycle_count;
+            sched_restore_context(frt, core_id);
+            /* The core was parked in the idle state; resume it. */
+            frt->cpu[core_id]->halted = false;
+        }
+        pthread_mutex_unlock(&frt->lock);
+        return next >= 0;
+    }
+    /* An idle task must give way to any real work at once, so treat it as
+     * below every priority rather than letting the equal-priority
+     * round-robin timeslice gate the switch. */
+    bool cur_is_idle = frt->tasks[frt->current_task[core_id]].is_idle;
+    int cur_prio = cur_is_idle
+                 ? -1 : (int)frt->tasks[frt->current_task[core_id]].priority;
+
+    /* Wake any sleeping tasks whose delay has expired */
+    sched_wake_sleepers(frt, core_id);
+
+    /* Find highest-priority READY task eligible for this core (other than current) */
+    int best_prio = -1;
+    int next = -1;
+    int start = (frt->current_task[core_id] + 1) % frt->task_count;
+    for (int j = 0; j < frt->task_count; j++) {
+        int i = (start + j) % frt->task_count;
+        if (i == frt->current_task[core_id]) continue;
+        task_tcb_t *t = &frt->tasks[i];
+        if (t->state != TASK_READY || t->is_idle) continue;
+        if (t->core_affinity >= 0 && t->core_affinity != core_id) continue;
+        if (t->priority > best_prio) {
+            best_prio = t->priority;
+            next = i;
+        }
+    }
+
+    /* FreeRTOS preemption rules:
+     * - Higher-priority task woke up: preempt immediately
+     * - Equal-priority task ready: round-robin timeslice
+     * - Only lower-priority tasks ready: don't preempt */
+    if (next < 0 || best_prio < cur_prio) {
+        pthread_mutex_unlock(&frt->lock);
+        return false;
+    }
+
+    /* For equal priority, round-robin: pick first READY at this priority
+     * starting after current_task in array order */
+    if (best_prio == cur_prio) {
+        /* A tick only gates round-robin scheduling between equal-priority
+         * tasks.  A task unblocked by an ISR at a higher priority must
+         * preempt immediately, even when the current time slice has barely
+         * begun. */
+        if (frt->cpu[core_id]->cycle_count -
+                frt->last_switch_cycle[core_id] < frt->cycles_per_tick) {
+            pthread_mutex_unlock(&frt->lock);
+            return false;
+        }
+        next = -1;
+        for (int j = 1; j < frt->task_count; j++) {
+            int i = (frt->current_task[core_id] + j) % frt->task_count;
+            task_tcb_t *t = &frt->tasks[i];
+            if (t->state == TASK_READY && t->priority == cur_prio &&
+                (t->core_affinity < 0 || t->core_affinity == core_id)) {
+                next = i;
+                break;
+            }
+        }
+        if (next < 0) {
+            pthread_mutex_unlock(&frt->lock);
+            return false;
+        }
+    }
+
+    int prev = frt->current_task[core_id];
+    sched_save_context(frt, core_id);
+    /* Only a task that was actually running becomes runnable again; marking
+     * unconditionally would resurrect one that is blocked or suspended. */
+    if (frt->tasks[prev].state == TASK_RUNNING)
+        frt->tasks[prev].state = TASK_READY;
+
+    frt->current_task[core_id] = next;
+    frt->tasks[next].state = TASK_RUNNING;
+    frt->last_switch_cycle[core_id] = frt->cpu[core_id]->cycle_count;
+    sched_restore_context(frt, core_id);
+    /* Leaving the idle task means leaving WAITI. */
+    frt->cpu[core_id]->halted = false;
+
+    if (frt->event_fn && next != prev) {
+        const char *from = frt->tasks[prev].name;
+        const char *to = frt->tasks[next].name;
+        frt->event_fn(from, to, frt->cpu[core_id]->cycle_count, frt->event_ctx);
+    }
+    pthread_mutex_unlock(&frt->lock);
+    return true;
+}
+
+bool freertos_stubs_check_preempt(freertos_stubs_t *frt) {
+    return freertos_stubs_check_preempt_core(frt, 0);
+}
+
+/* ===== Public API ===== */
+
+freertos_stubs_t *freertos_stubs_create(xtensa_cpu_t *cpu) {
+    freertos_stubs_t *frt = calloc(1, sizeof(*frt));
+    if (!frt) return NULL;
+    frt->cpu[0] = cpu;
+    frt->cpu[1] = NULL;
+    frt->bump_ptr = BUMP_BASE;
+    frt->cpu_freq_mhz = 160;
+    frt->cycles_per_tick = 160000;  /* 160 MHz / 1 kHz */
+    frt->current_task[0] = -1;
+    frt->current_task[1] = -1;
+    pthread_mutex_init(&frt->lock, NULL);
+    return frt;
+}
+
+void freertos_stubs_destroy(freertos_stubs_t *frt) {
+    if (!frt) return;
+    pthread_mutex_destroy(&frt->lock);
+    free(frt);
+}
+
+void freertos_stubs_attach_cpu(freertos_stubs_t *frt, int core_id, xtensa_cpu_t *cpu) {
+    if (!frt || core_id < 0 || core_id > 1) return;
+    frt->cpu[core_id] = cpu;
+}
+
+void freertos_stubs_set_event_fn(freertos_stubs_t *frt, freertos_event_fn fn, void *ctx) {
+    if (!frt) return;
+    frt->event_fn = fn;
+    frt->event_ctx = ctx;
+}
+
+const char *freertos_stubs_current_task_name(const freertos_stubs_t *frt, int core_id) {
+    if (!frt || core_id < 0 || core_id > 1) return NULL;
+    if (frt->current_task[core_id] < 0) return NULL;
+    return frt->tasks[frt->current_task[core_id]].name;
+}
+
+int freertos_stubs_dump_tasks(const freertos_stubs_t *frt, char *buf, int buflen) {
+    static const char *state_names[] = {
+        "UNUSED", "READY", "RUNNING", "SLEEPING", "BLOCKED_QUEUE",
+        "BLOCKED_NOTIFY"
+    };
+    if (!frt || !buf || buflen <= 0) return 0;
+    int n = 0;
+    n += snprintf(buf + n, buflen - n,
+                  "scheduler=%d task_count=%d cur0=%d cur1=%d\n",
+                  frt->scheduler_started, frt->task_count,
+                  frt->current_task[0], frt->current_task[1]);
+    for (int i = 0; i < MAX_TASKS && n < buflen; i++) {
+        const task_tcb_t *t = &frt->tasks[i];
+        if (t->state == TASK_UNUSED) continue;
+        uint32_t a0 = t->ar[(t->windowbase * 4 + 0) & 63];
+        uint32_t a1 = t->ar[(t->windowbase * 4 + 1) & 63];
+        n += snprintf(buf + n, buflen - n,
+                      "[%d] %-12s st=%-13s core=%d pc=0x%08X a0=0x%08X a1=0x%08X "
+                      "entry=0x%08X wake=%llu q=0x%08X\n",
+                      i, t->name, state_names[t->state & 7], t->core_affinity,
+                      t->pc, a0, a1, t->entry_fn,
+                      (unsigned long long)t->wake_cycle, t->blocked_queue);
+    }
+    return n;
+}
+
+int freertos_stubs_hook_symbols(freertos_stubs_t *frt, const elf_symbols_t *syms) {
+    if (!frt || !syms) return 0;
+
+    /* We need a rom_stubs handle to register hooks. Get it from cpu->pc_hook_ctx */
+    esp32_rom_stubs_t *rom = frt->cpu[0]->pc_hook_ctx;
+    if (!rom) return 0;
+    frt->rom = rom;
+
+    int hooked = 0;
+    frt->core_startup_done_addr = 0u;
+    uint32_t startup_done_addr;
+    if (elf_symbols_find(syms, "port_uxCoreStartupDone",
+                         &startup_done_addr) == 0)
+        frt->core_startup_done_addr = startup_done_addr;
+
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } hooks[] = {
+        { "vTaskDelay",                    stub_vTaskDelay },
+        { "xTaskCreate",                   stub_xTaskCreate },
+        { "xTaskCreatePinnedToCore",       stub_xTaskCreatePinnedToCore },
+        { "vTaskDelete",                   stub_vTaskDelete },
+        { "xTaskGetTickCount",             stub_xTaskGetTickCount },
+        { "vTaskDelayUntil",               stub_vTaskDelayUntil },
+        { "vTaskResume",                   stub_vTaskResume },
+        { "xTaskResumeFromISR",            stub_vTaskResumeFromISR },
+        { "vTaskResumeFromISR",            stub_vTaskResumeFromISR },
+        { "xTaskDelayUntil",               stub_xTaskDelayUntil },
+        { "xEventGroupCreate",             stub_xEventGroupCreate },
+        { "xEventGroupCreateStatic",       stub_xEventGroupCreate },
+        { "xEventGroupWaitBits",           stub_xEventGroupWaitBits },
+        { "xEventGroupSetBits",            stub_xEventGroupSetBits },
+        { "xEventGroupSetBitsFromISR",     stub_xEventGroupSetBitsFromISR },
+        { "xEventGroupClearBits",          stub_xEventGroupClearBits },
+        { "xEventGroupClearBitsFromISR",   stub_xEventGroupClearBitsFromISR },
+        { "xEventGroupGetBitsFromISR",     stub_xEventGroupGetBitsFromISR },
+        { "xEventGroupSync",               stub_xEventGroupSync },
+        { "vEventGroupDelete",             stub_vEventGroupDelete },
+        { "xTimerCreate",                  stub_xTimerCreate },
+        { "xTimerCreateStatic",            stub_xTimerCreateStatic },
+        { "xTimerGenericCommand",          stub_xTimerGenericCommand },
+        /* FreeRTOS v11 split the command entry point in two; hook both so a
+         * newer Arduino core keeps working. */
+        { "xTimerGenericCommandFromTask",  stub_xTimerGenericCommand },
+        { "xTimerGenericCommandFromISR",   stub_xTimerGenericCommand },
+        { "xTimerIsTimerActive",           stub_xTimerIsTimerActive },
+        { "pvTimerGetTimerID",             stub_pvTimerGetTimerID },
+        { "vTimerSetTimerID",              stub_vTimerSetTimerID },
+        { "pcTimerGetName",                stub_pcTimerGetName },
+        { "xTimerGetPeriod",               stub_xTimerGetPeriod },
+        { "xTimerGetExpiryTime",           stub_xTimerGetExpiryTime },
+        { "uxQueueMessagesWaiting",        stub_uxQueueMessagesWaiting },
+        { "uxQueueMessagesWaitingFromISR", stub_uxQueueMessagesWaiting },
+        { "uxSemaphoreGetCount",           stub_uxQueueMessagesWaiting },
+        { "uxQueueSpacesAvailable",        stub_uxQueueSpacesAvailable },
+        { "xQueueIsQueueEmptyFromISR",     stub_xQueueIsQueueEmptyFromISR },
+        { "xQueueReset",                   stub_xQueueReset },
+        { "xQueuePeekFromISR",             stub_xQueuePeekFromISR },
+        { "xQueuePeek",                    stub_xQueuePeek },
+        { "xQueueCreate",                  stub_xQueueCreate },
+        { "xQueueGenericCreate",           stub_xQueueGenericCreate },
+        { "xQueueGenericCreateStatic",     stub_xQueueGenericCreateStatic },
+        { "xQueueSend",                    stub_xQueueSend },
+        { "xQueueSendToBack",             stub_xQueueSend },
+        { "xQueueGenericSend",             stub_xQueueGenericSend },
+        { "xQueueSendFromISR",             stub_xQueueSendFromISR },
+        { "xQueueGenericSendFromISR",      stub_xQueueGenericSendFromISR },
+        { "xQueueGiveFromISR",             stub_xQueueGiveFromISR },
+        { "vTaskGenericNotifyGiveFromISR", stub_vTaskGenericNotifyGiveFromISR },
+        { "vTaskNotifyGiveFromISR",        stub_vTaskNotifyGiveFromISR },
+        { "ulTaskGenericNotifyTake",       stub_ulTaskGenericNotifyTake },
+        { "ulTaskNotifyTake",              stub_ulTaskNotifyTake },
+        { "xQueueReceive",                stub_xQueueReceive },
+        { "xQueueGenericReceive",          stub_xQueueReceive },
+        { "xQueueReceiveFromISR",          stub_xQueueReceiveFromISR },
+        { "xQueueIsQueueFullFromISR",      stub_xQueueIsQueueFullFromISR },
+        { "xSemaphoreCreateMutex",         stub_xSemaphoreCreateMutex },
+        { "xQueueCreateMutex",             stub_xSemaphoreCreateMutex },
+        { "xSemaphoreCreateRecursiveMutex", stub_xSemaphoreCreateMutex },
+        { "xQueueCreateMutexStatic",       stub_xQueueCreateMutexStatic },
+        { "xQueueTakeMutexRecursive",      stub_xQueueTakeMutexRecursive },
+        { "xQueueGiveMutexRecursive",      stub_xQueueGiveMutexRecursive },
+        { "xSemaphoreCreateBinary",        stub_xSemaphoreCreateBinary },
+        { "xQueueCreateCountingSemaphore", stub_xQueueCreateCountingSemaphore },
+        { "xQueueCreateCountingSemaphoreStatic",
+                                             stub_xQueueCreateCountingSemaphoreStatic },
+        { "xSemaphoreTake",                stub_xSemaphoreTake },
+        { "xQueueSemaphoreTake",           stub_xSemaphoreTake },
+        { "xSemaphoreGive",                stub_xSemaphoreGive },
+        { "xQueueGenericReset",            stub_xQueueGenericReset },
+        { "xQueueGenericGetStaticBuffers", stub_xQueueGenericGetStaticBuffers },
+        { "vQueueDelete",                  stub_vQueueDelete },
+        { "xRingbufferCreate",             stub_xRingbufferCreate },
+        { "xRingbufferCreateWithCaps",     stub_xRingbufferCreateWithCaps },
+        { "xRingbufferCreateStatic",       stub_xRingbufferCreateStatic },
+        { "xRingbufferCreateNoSplit",      stub_xRingbufferCreateNoSplit },
+        { "xRingbufferSend",               stub_xRingbufferSend },
+        { "xRingbufferSendFromISR",        stub_xRingbufferSendFromISR },
+        { "xRingbufferSendAcquire",        stub_xRingbufferSendAcquire },
+        { "xRingbufferSendComplete",       stub_xRingbufferSendComplete },
+        { "xRingbufferReceive",            stub_xRingbufferReceive },
+        { "xRingbufferReceiveFromISR",     stub_xRingbufferReceiveFromISR },
+        { "xRingbufferReceiveUpTo",        stub_xRingbufferReceiveUpTo },
+        { "xRingbufferReceiveUpToFromISR", stub_xRingbufferReceiveUpToFromISR },
+        { "xRingbufferReceiveSplit",       stub_xRingbufferReceiveSplit },
+        { "xRingbufferReceiveSplitFromISR", stub_xRingbufferReceiveSplitFromISR },
+        { "vRingbufferReturnItem",         stub_vRingbufferReturnItem },
+        { "vRingbufferReturnItemFromISR",  stub_vRingbufferReturnItemFromISR },
+        { "vRingbufferDelete",             stub_vRingbufferDelete },
+        { "vRingbufferDeleteWithCaps",     stub_vRingbufferDeleteWithCaps },
+        { "xRingbufferGetMaxItemSize",     stub_xRingbufferGetMaxItemSize },
+        { "xRingbufferGetCurFreeSize",     stub_xRingbufferGetCurFreeSize },
+        { "xRingbufferGetStaticBuffer",    stub_xRingbufferGetStaticBuffer },
+        { "vRingbufferGetInfo",            stub_vRingbufferGetInfo },
+        { "xRingbufferAddToQueueSetRead",  stub_xRingbufferQueueSetNoop },
+        { "xRingbufferRemoveFromQueueSetRead", stub_xRingbufferQueueSetNoop },
+        { "xRingbufferPrintInfo",          stub_xRingbufferPrintInfo },
+        { "pvPortMalloc",                  stub_pvPortMalloc },
+        { "vPortFree",                     stub_vPortFree },
+        { "xTaskGetCurrentTaskHandle",     stub_xTaskGetCurrentTaskHandle },
+        { "vTaskSuspend",                  stub_vTaskSuspend },
+        { "uxTaskGetStackHighWaterMark",   stub_uxTaskGetStackHighWaterMark },
+        { "uxTaskGetNumberOfTasks",        stub_uxTaskGetNumberOfTasks },
+        { "uxTaskGetSystemState",          stub_uxTaskGetSystemState },
+        { "disableCore0WDT",               stub_disableCoreWDT },
+        { "disableCore1WDT",               stub_disableCoreWDT },
+        { "disableLoopWDT",                stub_disableCoreWDT },
+        { "enableCore0WDT",                stub_disableCoreWDT },
+        { "enableCore1WDT",                stub_disableCoreWDT },
+        { "enableLoopWDT",                 stub_disableCoreWDT },
+        { "xTaskGetIdleTaskHandleForCPU",  stub_xTaskGetIdleTaskHandleForCPU },
+        { "xPortEnterCriticalTimeout",     stub_xPortEnterCriticalTimeout },
+        { "vPortExitCritical",             stub_xPortEnterCriticalTimeout },
+        { "vPortEnterCritical",            stub_xPortEnterCriticalTimeout },
+        { "vPortEvaluateYieldFromISR",     stub_vPortEvaluateYieldFromISR },
+        { "xTaskGetSchedulerState",        stub_xTaskGetSchedulerState },
+        { "esp_ipc_call",                  stub_esp_ipc_noop },
+        { "esp_ipc_call_blocking",         stub_esp_ipc_noop },
+        { "esp_ipc_isr_stall_other_cpu",   stub_esp_ipc_noop },
+        { "esp_ipc_isr_release_other_cpu", stub_esp_ipc_noop },
+        { "esp_ipc_isr_stall_pause",       stub_esp_ipc_noop },
+        { "esp_ipc_isr_stall_resume",      stub_esp_ipc_noop },
+        { "vApplicationStackOverflowHook", stub_disableCoreWDT },
+        { "vTaskStartScheduler",           stub_vTaskStartScheduler },
+        { "vPortYield",                    stub_vPortYield },
+        { "vTaskSwitchContext",            stub_vPortYield },
+        { "xPortGetCoreID",               stub_xPortGetCoreID },
+        { "esp_startup_start_app_other_cores", stub_esp_startup_start_app_other_cores },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, frt);
+            hooked++;
+        }
+    }
+
+    /* Register deferred-task trampoline at ROM base (0x40000000) and _xt_panic.
+     * When app_main returns after creating tasks, the call chain unwinds to ROM
+     * or panics — this catches both and redirects to the saved task function. */
+    rom_stubs_register_ctx(rom, 0x40000000u, stub_deferred_task_trampoline,
+                           "deferred_task_trampoline", frt);
+    {
+        uint32_t addr;
+        if (elf_symbols_find(syms, "_xt_panic", &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, stub_deferred_task_trampoline,
+                                   "_xt_panic", frt);
+            hooked++;
+        }
+    }
+
+    return hooked;
+}
+
+/* Stub that fires when execution reaches a dead end (e.g., app_main returns
+ * to ROM after creating a FreeRTOS task).  If multiple tasks were registered,
+ * start the cooperative scheduler.  Otherwise, use legacy single-task launch. */
+static void stub_deferred_task_trampoline(xtensa_cpu_t *cpu, void *ctx) {
+    freertos_stubs_t *frt = ctx;
+    pthread_mutex_lock(&frt->lock);
+    if (frt->task_count > 1) {
+        /* Multi-task: start cooperative scheduler */
+        sched_start(frt);
+        pthread_mutex_unlock(&frt->lock);
+    } else if (frt->deferred_task_fn) {
+        uint32_t fn = frt->deferred_task_fn;
+        uint32_t param = frt->deferred_task_param;
+        frt->deferred_task_fn = 0;  /* one-shot */
+        pthread_mutex_unlock(&frt->lock);
+        /* Set up a fresh call context for the task function */
+        ar_write(cpu, 1,
+                 flexe_target_bootstrap_stack(cpu->target, 0));
+        ar_write(cpu, 2, param);
+        cpu->pc = fn;
+        cpu->ps = 0x00040020u;  /* WOE=1, UM=1 */
+    } else {
+        pthread_mutex_unlock(&frt->lock);
+        cpu->running = 0;
+    }
+}
+
+uint32_t freertos_stubs_bump_ptr(const freertos_stubs_t *frt) {
+    return frt ? frt->bump_ptr : 0;
+}
+
+uint32_t freertos_stubs_deferred_task(const freertos_stubs_t *frt, uint32_t *param_out) {
+    if (!frt) return 0;
+    if (param_out) *param_out = frt->deferred_task_param;
+    return frt->deferred_task_fn;
+}
+
+uint32_t freertos_stubs_consume_deferred_task(freertos_stubs_t *frt, uint32_t *param_out) {
+    if (!frt) return 0;
+    pthread_mutex_lock(&frt->lock);
+    /* If scheduler has multiple tasks, start it and signal caller to skip manual setup */
+    if (frt->task_count > 1) {
+        sched_start(frt);
+        pthread_mutex_unlock(&frt->lock);
+        return 0;  /* tell caller not to do manual PC/SP setup */
+    }
+    /* Legacy single-task path */
+    if (!frt->deferred_task_fn) {
+        pthread_mutex_unlock(&frt->lock);
+        return 0;
+    }
+    uint32_t fn = frt->deferred_task_fn;
+    if (param_out) *param_out = frt->deferred_task_param;
+    frt->deferred_task_fn = 0;  /* one-shot */
+    pthread_mutex_unlock(&frt->lock);
+    return fn;
+}
+
+bool freertos_stubs_scheduler_active(const freertos_stubs_t *frt) {
+    return frt && frt->scheduler_started;
+}
+
+void freertos_stubs_start_scheduler(freertos_stubs_t *frt) {
+    if (!frt) return;
+    pthread_mutex_lock(&frt->lock);
+    if (frt->task_count > 1) {
+        sched_start(frt);
+    } else if (frt->deferred_task_fn) {
+        /* Legacy single-task: jump directly to the deferred task */
+        uint32_t fn = frt->deferred_task_fn;
+        uint32_t param = frt->deferred_task_param;
+        frt->deferred_task_fn = 0;
+        ar_write(frt->cpu[0], 1,
+                 flexe_target_bootstrap_stack(frt->cpu[0]->target, 0));
+        ar_write(frt->cpu[0], 2, param);
+        frt->cpu[0]->pc = fn;
+        frt->cpu[0]->ps = 0x00040020u;
+    } else {
+        frt->cpu[0]->running = 0;
+    }
+    pthread_mutex_unlock(&frt->lock);
+}
+
+/* ===== Save/Restore FreeRTOS State ===== */
+
+int freertos_stubs_save_state(const freertos_stubs_t *frt, FILE *f) {
+    if (!frt || !f) return -1;
+
+    /* Save bump allocator state */
+    if (fwrite(&frt->bump_ptr, sizeof(frt->bump_ptr), 1, f) != 1) return -1;
+
+    /* Save tick configuration */
+    if (fwrite(&frt->cycles_per_tick, sizeof(frt->cycles_per_tick), 1, f) != 1) return -1;
+    if (fwrite(&frt->cpu_freq_mhz, sizeof(frt->cpu_freq_mhz), 1, f) != 1) return -1;
+
+    /* Save queue storage */
+    if (fwrite(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
+    if (fwrite(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
+
+    /* Save ring-buffer metadata. Payload bytes live in guest memory and are
+     * already covered by the surrounding machine-memory snapshot. */
+    if (fwrite(&frt->ringbuffer_count, sizeof(frt->ringbuffer_count), 1, f) != 1) return -1;
+    if (fwrite(frt->ringbuffers, sizeof(frt->ringbuffers), 1, f) != 1) return -1;
+
+    /* Save event groups */
+    if (fwrite(&frt->event_group_count, sizeof(frt->event_group_count), 1, f) != 1) return -1;
+    if (fwrite(frt->event_groups, sizeof(frt->event_groups), 1, f) != 1) return -1;
+
+    /* Save software timers */
+    if (fwrite(&frt->sw_timer_count, sizeof(frt->sw_timer_count), 1, f) != 1) return -1;
+    if (fwrite(frt->sw_timers, sizeof(frt->sw_timers), 1, f) != 1) return -1;
+
+    /* Save deferred task */
+    if (fwrite(&frt->deferred_task_fn, sizeof(frt->deferred_task_fn), 1, f) != 1) return -1;
+    if (fwrite(&frt->deferred_task_param, sizeof(frt->deferred_task_param), 1, f) != 1) return -1;
+
+    /* Save scheduler state */
+    if (fwrite(&frt->task_count, sizeof(frt->task_count), 1, f) != 1) return -1;
+    if (fwrite(frt->tasks, sizeof(frt->tasks), 1, f) != 1) return -1;
+    if (fwrite(frt->current_task, sizeof(frt->current_task), 1, f) != 1) return -1;
+    if (fwrite(&frt->scheduler_started, sizeof(frt->scheduler_started), 1, f) != 1) return -1;
+    if (fwrite(frt->last_switch_cycle, sizeof(frt->last_switch_cycle), 1, f) != 1) return -1;
+
+    return 0;
+}
+
+int freertos_stubs_restore_state(freertos_stubs_t *frt, FILE *f) {
+    if (!frt || !f) return -1;
+
+    /* Restore bump allocator state */
+    if (fread(&frt->bump_ptr, sizeof(frt->bump_ptr), 1, f) != 1) return -1;
+
+    /* Restore tick configuration */
+    if (fread(&frt->cycles_per_tick, sizeof(frt->cycles_per_tick), 1, f) != 1) return -1;
+    if (fread(&frt->cpu_freq_mhz, sizeof(frt->cpu_freq_mhz), 1, f) != 1) return -1;
+
+    /* Restore queue storage */
+    if (fread(&frt->queue_count, sizeof(frt->queue_count), 1, f) != 1) return -1;
+    if (frt->queue_count < 0 || frt->queue_count > MAX_QUEUES) return -1;
+    if (fread(frt->queues, sizeof(frt->queues), 1, f) != 1) return -1;
+
+    /* Restore ring-buffer metadata after its guest-visible payload. */
+    if (fread(&frt->ringbuffer_count, sizeof(frt->ringbuffer_count), 1, f) != 1) return -1;
+    if (frt->ringbuffer_count < 0 ||
+        frt->ringbuffer_count > MAX_RINGBUFFERS) return -1;
+    if (fread(frt->ringbuffers, sizeof(frt->ringbuffers), 1, f) != 1) return -1;
+    for (int i = 0; i < frt->ringbuffer_count; i++) {
+        const ringbuffer_t *rb = &frt->ringbuffers[i];
+        if (rb->handle == 0u) continue;
+        if (rb->type > RINGBUF_TYPE_BYTEBUF || rb->used > rb->capacity ||
+            rb->borrowed_len > rb->used ||
+            rb->acquired_len > rb->capacity - rb->used ||
+            rb->item_count > MAX_RINGBUFFER_ITEMS)
+            return -1;
+    }
+
+    /* Restore event groups */
+    if (fread(&frt->event_group_count, sizeof(frt->event_group_count), 1, f) != 1) return -1;
+    if (fread(frt->event_groups, sizeof(frt->event_groups), 1, f) != 1) return -1;
+    if (frt->event_group_count < 0 || frt->event_group_count > MAX_EVENT_GROUPS)
+        return -1;
+
+    /* Restore software timers */
+    if (fread(&frt->sw_timer_count, sizeof(frt->sw_timer_count), 1, f) != 1) return -1;
+    if (fread(frt->sw_timers, sizeof(frt->sw_timers), 1, f) != 1) return -1;
+    if (frt->sw_timer_count < 0 || frt->sw_timer_count > MAX_SW_TIMERS)
+        return -1;
+
+    /* Restore deferred task */
+    if (fread(&frt->deferred_task_fn, sizeof(frt->deferred_task_fn), 1, f) != 1) return -1;
+    if (fread(&frt->deferred_task_param, sizeof(frt->deferred_task_param), 1, f) != 1) return -1;
+
+    /* Restore scheduler state */
+    if (fread(&frt->task_count, sizeof(frt->task_count), 1, f) != 1) return -1;
+    if (fread(frt->tasks, sizeof(frt->tasks), 1, f) != 1) return -1;
+    if (fread(frt->current_task, sizeof(frt->current_task), 1, f) != 1) return -1;
+    if (fread(&frt->scheduler_started, sizeof(frt->scheduler_started), 1, f) != 1) return -1;
+    if (fread(frt->last_switch_cycle, sizeof(frt->last_switch_cycle), 1, f) != 1) return -1;
+
+    return 0;
+}

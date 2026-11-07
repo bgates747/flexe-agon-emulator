@@ -1,0 +1,2125 @@
+#include "target.h"
+#include "touch_v2.h"
+
+#include <stddef.h>
+#include <string.h>
+
+static const flexe_touch_v2_desc_t ESP32S3_TOUCH_V2 = {
+    .channel_count = 15u,
+    .first_external_channel = 1u,
+    .rtc_control2_offset = 0x10Cu,
+    .rtc_scan_control_offset = 0x110u,
+    .rtc_sleep_threshold_offset = 0x114u,
+    .rtc_approach_offset = 0x118u,
+    .rtc_filter_offset = 0x11Cu,
+    .rtc_clock_enable_mask = 1u << 31,
+    .rtc_reset_mask = 1u << 29,
+    .rtc_start_force_mask = 1u << 16,
+    .rtc_start_enable_mask = 1u << 15,
+    .rtc_timer_enable_mask = 1u << 13,
+    .rtc_scan_channel_mask = 0x7FFFu << 10,
+    .rtc_scan_channel_shift = 10u,
+    .rtc_sleep_channel_mask = 0x1Fu << 27,
+    .rtc_sleep_channel_shift = 27u,
+    .rtc_sleep_threshold_mask = 0x003FFFFFu,
+    .rtc_sleep_benchmark_clear_mask = 1u << 23,
+    .sens_config_offset = 0x05Cu,
+    .sens_denoise_offset = 0x060u,
+    .sens_threshold_base_offset = 0x064u,
+    .sens_channel_status_offset = 0x09Cu,
+    .sens_status_base_offset = 0x0A0u,
+    .sens_sleep_status_offset = 0x0DCu,
+    .sens_approach_status_offset = 0x0E0u,
+    .sens_config_reset = 0xFFF07FFFu,
+    .sens_approach_channel_mask = {
+        0xFu << 28, 0xFu << 24, 0xFu << 20,
+    },
+    .sens_approach_channel_shift = { 28u, 24u, 20u },
+    .sens_unit_done_mask = 1u << 19,
+    .sens_denoise_done_mask = 1u << 18,
+    .sens_data_select_mask = 3u << 16,
+    .sens_data_select_shift = 16u,
+    .sens_status_clear_mask = 1u << 15,
+    .sens_output_enable_mask = 0x7FFFu,
+    .sens_threshold_mask = 0x003FFFFFu,
+    .sens_measure_done_mask = 1u << 31,
+    .sens_channel_clear_mask = 0x7FFFu << 15,
+    .sens_channel_clear_shift = 15u,
+    .sens_active_mask = 0x7FFFu,
+    .sens_current_channel_mask = 0xFu << 22,
+    .sens_current_channel_shift = 22u,
+    .sens_data_mask = 0x003FFFFFu,
+    .sens_debounce_mask = 7u << 29,
+    .sens_debounce_shift = 29u,
+    .interrupt_done_mask = 1u << 6,
+    .interrupt_active_mask = 1u << 7,
+    .interrupt_inactive_mask = 1u << 8,
+    .interrupt_scan_done_mask = 1u << 4,
+    .interrupt_timeout_mask = 1u << 18,
+    .interrupt_approach_done_mask = 1u << 20,
+    .rtc_wakeup_mask = 1u << 8,
+};
+
+/* Image chip IDs follow Espressif's public esp_chip_id_t values. The mapped
+ * flash windows match esptool's target definitions. Keeping recognized but
+ * unavailable targets here lets the loader fail explicitly instead of
+ * feeding a valid image to the wrong SoC model. */
+static const flexe_target_desc_t TARGETS[] = {
+    {
+        .descriptor_version = FLEXE_TARGET_DESCRIPTOR_VERSION,
+        .id = FLEXE_TARGET_ESP32,
+        .name = "esp32",
+        .display_name = "ESP32",
+        .image_chip_id = 0x0000,
+        .core_generation = FLEXE_XTENSA_LX6,
+        .translation_profile = FLEXE_XTENSA_TRANSLATE_WINDOWED_COMMON,
+        .core_count = 2,
+        .support_level = FLEXE_TARGET_STABLE,
+        .capabilities = FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS |
+                        FLEXE_TARGET_CAP_SPI_MEM |
+                        FLEXE_TARGET_CAP_IO_MUX_V1 |
+                        FLEXE_TARGET_CAP_I2C_V1 |
+                        FLEXE_TARGET_CAP_RADIO_REGS_V1 |
+                        FLEXE_TARGET_CAP_SHA_V1 |
+                        FLEXE_TARGET_CAP_AES_V1 |
+                        FLEXE_TARGET_CAP_GP_SPI |
+                        FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
+                        FLEXE_TARGET_CAP_TWAI_V1 |
+                        FLEXE_TARGET_CAP_PCNT_V1 |
+                        FLEXE_TARGET_CAP_MCPWM_V1 |
+                        FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
+        .reset_vector = 0x40000400u,
+        .vecbase_reset = 0x40000000u,
+        .configid0 = 0xC2BCFFFEu,
+        .configid1 = 0x1CC5FE96u,
+        .default_cpu_frequency_mhz = 160u,
+        .cpu_frequency_word = 0x3FFE01E0u,
+        .bootstrap_stack_top = { 0x3FFE0000u, 0x3FFE8000u },
+        .interrupt_level = {
+            1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 3, 1, 1, 7, 3,
+            5, 1, 1, 2, 2, 2, 3, 3,
+            4, 4, 5, 3, 4, 3, 4, 5,
+        },
+        .iram_start = 0x40080000u,
+        .iram_end = 0x400AA000u,
+        .dram_start = 0x3FFAE000u,
+        .dram_end = 0x40000000u,
+        .drom_start = 0x3F400000u,
+        .drom_end = 0x3F800000u,
+        .irom_start = 0x400D0000u,
+        .irom_end = 0x40400000u,
+        .default_app_offset = 0x00010000u,
+        .partition_table_offset = 0x00008000u,
+        .flash_mmu = {
+            .page_size = 0x00010000u,
+            .entry_count = 256,
+            .table_base = { 0x3FF10000u, 0x3FF12000u },
+            .invalid_entry = 0x00000100u,
+            .invalid_mask = 0x00000100u,
+            .physical_page_mask = 0x000000FFu,
+        },
+        .cache_control_base = 0x3FF00000u,
+        .cache_control_size = 0x00014000u,
+        .uart_count = 3,
+        .uart_ip = {
+            .register_size = 0x100u,
+            .interrupt_valid_mask = 0x0007FFFFu,
+            .status_idle_value = 0u,
+            .rx_full_threshold_mask = 0x7Fu,
+            .rx_timeout_enable_mask = 1u << 31,
+            .mem_rx_status_offset = 0x60u,
+            .fifo_address_mask = 0x7FFu,
+            .mem_rx_read_shift = 2u,
+            .mem_rx_write_shift = 13u,
+            .date_offset = 0x78u,
+            .date_reset = 0x15122500u,
+        },
+        .uart = {
+            { .base = 0x3FF40000u, .interrupt_source = 34u,
+              .tx_output_signal = 14u },
+            { .base = 0x3FF50000u, .interrupt_source = 35u,
+              .tx_output_signal = 17u },
+            { .base = 0x3FF6E000u, .interrupt_source = 36u,
+              .tx_output_signal = 198u },
+        },
+        .i2c = {
+            .register_size = 0x104u,
+            .date_reset = 0x16042000u,
+            .interrupt_valid_mask = 0x00001FFFu,
+            .interrupt_rxfifo_full_mask = 1u << 0,
+            .interrupt_txfifo_empty_mask = 1u << 1,
+            .interrupt_rxfifo_overflow_mask = 1u << 2,
+            .interrupt_end_detect_mask = 1u << 3,
+            .interrupt_slave_complete_mask = 1u << 4,
+            .interrupt_command_done_mask = 1u << 6,
+            .interrupt_transaction_complete_mask = 1u << 7,
+            .interrupt_transaction_start_mask = 1u << 9,
+            .interrupt_nack_mask = 1u << 10,
+            .instance_count = 2u,
+            .command_count = 16u,
+            .opcode_restart = 0u,
+            .opcode_write = 1u,
+            .opcode_read = 2u,
+            .opcode_stop = 3u,
+            .opcode_end = 4u,
+            .instance = {
+                { .base = 0x3FF53000u, .interrupt_source = 49u,
+                  .scl_output_signal = 29u, .sda_output_signal = 30u },
+                { .base = 0x3FF67000u, .interrupt_source = 50u,
+                  .scl_output_signal = 95u, .sda_output_signal = 96u },
+            },
+        },
+        .sdmmc_host = {
+            .base = 0x3FF68000u,
+            .register_size = 0x1000u,
+            .version_reset = 0x5342240Au,
+            .interrupt_source = 37u,
+            .slot_count = 2u,
+        },
+        .twai = {
+            .base = 0x3FF6B000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = 80000000u,
+            .bus_timing_0_writable_mask = 0x000000FFu,
+            .brp_mask = 0x0000003Fu,
+            .clock_divider_writable_mask = 0x0000008Fu,
+            .tx_output_signal = 123u,
+            .rx_input_signal = 94u,
+            .bus_off_output_signal = 124u,
+            .clock_output_signal = 125u,
+            .interrupt_source = 45u,
+            .interrupt_enable_writable_mask = 0xFFu,
+            .brp_divider_mask = 1u << 4,
+        },
+        .pcnt = {
+            .base = 0x3FF57000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = 80000000u,
+            .conf0_reset = 0x00003C10u,
+            .control_reset = 0x00005555u,
+            .control_writable_mask = 0x0001FFFFu,
+            .date_reset = 0x14122600u,
+            .conf_stride = 0x00Cu,
+            .count_offset = 0x060u,
+            .interrupt_raw_offset = 0x080u,
+            .interrupt_status_offset = 0x084u,
+            .interrupt_enable_offset = 0x088u,
+            .interrupt_clear_offset = 0x08Cu,
+            .unit_status_offset = 0x090u,
+            .control_offset = 0x0B0u,
+            .date_offset = 0x0FCu,
+            .pulse_input_signal = {
+                { 39u, 40u }, { 43u, 44u },
+                { 47u, 48u }, { 51u, 52u },
+                { 55u, 56u }, { 71u, 72u },
+                { 75u, 76u }, { 79u, 80u },
+            },
+            .control_input_signal = {
+                { 41u, 42u }, { 45u, 46u },
+                { 49u, 50u }, { 53u, 54u },
+                { 57u, 58u }, { 73u, 74u },
+                { 77u, 78u }, { 81u, 82u },
+            },
+            .unit_count = 8u,
+            .channel_count = 2u,
+            .interrupt_source = 48u,
+        },
+        .mcpwm = {
+            .base = { 0x3FF5E000u, 0x3FF6C000u },
+            .register_size = 0x1000u,
+            .source_clock_hz = 160000000u,
+            .capture_clock_hz = 80000000u,
+            .version_reset = 0x02107230u,
+            .output_signal = {
+                { { 32u, 33u }, { 34u, 35u }, { 36u, 37u } },
+                { { 108u, 109u }, { 110u, 111u }, { 112u, 113u } },
+            },
+            .sync_input_signal = {
+                { 31u, 32u, 33u }, { 103u, 104u, 105u },
+            },
+            .fault_input_signal = {
+                { 34u, 35u, 36u }, { 106u, 107u, 108u },
+            },
+            .capture_input_signal = {
+                { 109u, 110u, 111u }, { 112u, 113u, 114u },
+            },
+            .group_count = 2u,
+            .interrupt_source = { 39u, 40u },
+        },
+        .io_mux = {
+            .base = 0x3FF49000u,
+            .register_size = 0x1000u,
+            .register_count = 64u,
+            .gpio_count = 40u,
+            .function_shift = 12u,
+            .control_offset = 0u,
+            .control_reset = 0u,
+            .control_writable_mask = 0x0000FFFFu,
+            .register_reset = 0x00001800u,
+            .register_writable_mask = 0x0000FFFFu,
+            .function_mask = 0x00007000u,
+            .input_enable_mask = 1u << 9u,
+            .date_offset = UINT32_MAX,
+            .gpio_register_offset = {
+                0x044u, 0x088u, 0x040u, 0x084u, 0x048u,
+                0x06Cu, 0x060u, 0x064u, 0x068u, 0x054u,
+                0x058u, 0x05Cu, 0x034u, 0x038u, 0x030u,
+                0x03Cu, 0x04Cu, 0x050u, 0x070u, 0x074u,
+                0x078u, 0x07Cu, 0x080u, 0x08Cu, 0x090u,
+                0x024u, 0x028u, 0x02Cu,
+                FLEXE_TARGET_IO_MUX_OFFSET_NONE,
+                FLEXE_TARGET_IO_MUX_OFFSET_NONE,
+                FLEXE_TARGET_IO_MUX_OFFSET_NONE,
+                FLEXE_TARGET_IO_MUX_OFFSET_NONE,
+                0x01Cu, 0x020u, 0x014u, 0x018u, 0x004u,
+                0x008u, 0x00Cu, 0x010u,
+            },
+        },
+        .radio = {
+            .window_count = 10u,
+            .completion_count = 2u,
+            .window = {
+                { 0x3FF45000u, 0x1000u, 0u, 0u }, /* FE2 */
+                { 0x3FF46000u, 0x1000u, 0u, 0u }, /* FE */
+                { 0x3FF4E000u, 0x1000u, 0u, 0u }, /* private PHY */
+                { 0x3FF51000u, 0x1000u, 0u, 0u }, /* BT */
+                { 0x3FF5C000u, 0x1000u, 0u, 0u }, /* private NRX + NRX */
+                { 0x3FF5D000u, 0x1000u, 0u, 0u }, /* BB */
+                { 0x3FF71000u, 0x1000u, 0u, 0u }, /* private BT */
+                { 0x3FF72000u, 0x1000u, 0u, 0u }, /* BT MAC */
+                { 0x3FF73000u, 0x2000u, 0u, 0u }, /* Wi-Fi MAC */
+                { 0x3FF75000u, 0x1000u, 0u, 0u }, /* WDEV */
+            },
+            .completion = {
+                /* Wi-Fi MAC reset request bit 1 reports ready in bit 0. */
+                {
+                    .control_address = 0x3FF73D24u,
+                    .active_mask = 1u << 1,
+                    .status_address = 0x3FF73D24u,
+                    .status_mask = 1u << 0,
+                },
+                /* Indexed PHY calibration command is consumed on write. */
+                {
+                    .control_address = 0x3FF4E0C4u,
+                    .self_clear_mask = UINT32_MAX,
+                },
+            },
+            .random_address = 0x3FF75144u,
+            .random_seed = UINT64_C(0x12345678ABCDEF01),
+        },
+        .sha = {
+            .base = 0x3FF03000u,
+            .register_size = 0x1000u,
+            .layout = FLEXE_SHA_LAYOUT_ESP32,
+            .mode_count = 4u,
+            .dma_peripheral_id = UINT8_MAX,
+            .mode = {
+                FLEXE_SHA_ALGORITHM_SHA1,
+                FLEXE_SHA_ALGORITHM_SHA256,
+                FLEXE_SHA_ALGORITHM_SHA384,
+                FLEXE_SHA_ALGORITHM_SHA512,
+            },
+        },
+        .aes = {
+            .base = 0x3FF01000u,
+            .register_size = 0x1000u,
+            .layout = FLEXE_AES_LAYOUT_ESP32,
+            .key_size_mask = 0x07u,
+            .dma_peripheral_id = UINT8_MAX,
+            .interrupt_source = UINT8_MAX,
+        },
+        .gp_spi = {
+            .register_size = 0x1000u,
+            .date_reset = 0x01604270u,
+            .host_count = 2u,
+            .layout = FLEXE_GP_SPI_LAYOUT_ESP32,
+            .instance = {
+                {
+                    .base = 0x3FF64000u,
+                    .clock_out_signal = 8u,
+                    .data_out_signal = { 9u, 10u, 12u, 13u },
+                    .chip_select_out_signal = {
+                        11u, 61u, 62u,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                    },
+                    .interrupt_source = 30u,
+                    .data_out_signal_count = 4u,
+                    .chip_select_count = 3u,
+                    .iomux_clock_pin = 14u,
+                    .iomux_chip_select0_pin = 15u,
+                    .iomux_function = 1u,
+                    .gdma_peripheral_id = FLEXE_TARGET_GDMA_PERIPHERAL_NONE,
+                },
+                {
+                    .base = 0x3FF65000u,
+                    .clock_out_signal = 63u,
+                    .data_out_signal = { 64u, 65u, 66u, 67u },
+                    .chip_select_out_signal = {
+                        68u, 69u, 70u,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                    },
+                    .interrupt_source = 31u,
+                    .data_out_signal_count = 4u,
+                    .chip_select_count = 3u,
+                    .iomux_clock_pin = 18u,
+                    .iomux_chip_select0_pin = 5u,
+                    .iomux_function = 1u,
+                    .gdma_peripheral_id = FLEXE_TARGET_GDMA_PERIPHERAL_NONE,
+                },
+            },
+        },
+        .spi_mem = {
+            .base = { 0x3FF43000u, 0x3FF42000u },
+            .register_size = 0x1000u,
+            .default_jedec_id = 0x001640C8u,
+            .maximum_flash_size = 0x01000000u,
+            .date_reset = 0x01604270u,
+            /* AP Memory's original 32-Mbit device: MFID 0x0D, KGD 0x5D,
+             * EID 0x20. This matches the existing 4-MiB PSRAM backing used
+             * by the default classic-ESP32 board profile. */
+            .default_psram_id = UINT64_C(0x0000000000205D0D),
+            .host_count = 2u,
+            .flash_chip_select = 0u,
+            .psram_chip_select = 1u,
+            .layout = FLEXE_SPI_MEM_LAYOUT_ESP32,
+            .psram_kind = FLEXE_SPI_MEM_PSRAM_QUAD,
+        },
+        .rom_flash = {
+            .live_data_address = 0x3FFAE270u,
+            .struct_size = 24u,
+            .device_id_offset = 0u,
+            .chip_size_offset = 4u,
+            .block_size_offset = 8u,
+            .sector_size_offset = 12u,
+            .page_size_offset = 16u,
+            .status_mask_offset = 20u,
+            .block_size = 0x00010000u,
+            .sector_size = 0x00001000u,
+            .page_size = 0x00000100u,
+            .status_mask = 0x0000FFFFu,
+        },
+        .backing_size = {
+            [FLEXE_MEM_SRAM] = 0x000B0000u,
+            [FLEXE_MEM_ROM] = 0x00080000u,
+            [FLEXE_MEM_FLASH_DATA] = 0x00400000u,
+            [FLEXE_MEM_FLASH_INSN] = 0x00400000u,
+            [FLEXE_MEM_RTC_FAST] = 0x00002000u,
+            [FLEXE_MEM_RTC_SLOW] = 0x00002000u,
+            [FLEXE_MEM_PSRAM] = 0x00400000u,
+        },
+        .memory_region_count = 10,
+        .memory_region = {
+            { 0x3F400000u, 0x3F800000u, FLEXE_MEM_FLASH_DATA, 0, "flash_data" },
+            { 0x3F800000u, 0x3FC00000u, FLEXE_MEM_PSRAM, 0, "psram" },
+            { 0x3FF80000u, 0x3FF82000u, FLEXE_MEM_RTC_FAST, 0, "rtc_dram" },
+            { 0x3FF90000u, 0x3FFA0000u, FLEXE_MEM_ROM, 0x00070000u, "rom_data" },
+            { 0x3FFA0000u, 0x40000000u, FLEXE_MEM_SRAM, 0, "sram_data" },
+            { 0x40000000u, 0x40070000u, FLEXE_MEM_ROM, 0, "rom" },
+            { 0x40070000u, 0x400C0000u, FLEXE_MEM_SRAM, 0x00060000u, "sram_insn" },
+            { 0x400C0000u, 0x400C2000u, FLEXE_MEM_RTC_FAST, 0, "rtc_iram" },
+            { 0x400D0000u, 0x40400000u, FLEXE_MEM_FLASH_INSN, 0, "flash_insn" },
+            { 0x50000000u, 0x50002000u, FLEXE_MEM_RTC_SLOW, 0, "rtc_slow" },
+        },
+        .peripheral_start = 0x3FF00000u,
+        .peripheral_end = 0x3FF80000u,
+        .peripheral_alias_start = 0x60000000u,
+        .peripheral_alias_end = 0x60040000u,
+        .peripheral_alias_delta = -0x200C0000,
+        .executable_range_count = 3,
+        .executable = {
+            { 0x40000000u, 0x400C2000u }, /* ROM, cache, IRAM, RTC fast */
+            { 0x400D0000u, 0x40C00000u }, /* flash MMU instruction buses */
+            { 0x50000000u, 0x50002000u }, /* RTC slow/reset vector 0 */
+        },
+    },
+    {
+        .descriptor_version = FLEXE_TARGET_DESCRIPTOR_VERSION,
+        .id = FLEXE_TARGET_ESP32S3,
+        .name = "esp32s3",
+        .display_name = "ESP32-S3",
+        .image_chip_id = 0x0009,
+        .core_generation = FLEXE_XTENSA_LX7,
+        .translation_profile = FLEXE_XTENSA_TRANSLATE_WINDOWED_COMMON,
+        .core_count = 2,
+        .support_level = FLEXE_TARGET_STABLE,
+        .capabilities = FLEXE_TARGET_CAP_ESP32S3_EXTMEM |
+                        FLEXE_TARGET_CAP_DIRECT_ROM_DATA_INIT |
+                        FLEXE_TARGET_CAP_SECONDARY_CORE_CONTROL |
+                        FLEXE_TARGET_CAP_RTC_CALIBRATION |
+                        FLEXE_TARGET_CAP_REGI2C |
+                        FLEXE_TARGET_CAP_SENSITIVE_MEMPROT_V1 |
+                        FLEXE_TARGET_CAP_SYSTIMER_V1 |
+                        FLEXE_TARGET_CAP_SPI_MEM |
+                        FLEXE_TARGET_CAP_INTERRUPT_MATRIX_V1 |
+                        FLEXE_TARGET_CAP_USB_SERIAL_JTAG_V1 |
+                        FLEXE_TARGET_CAP_TIMER_GROUP_V1 |
+                        FLEXE_TARGET_CAP_SYSTEM_CLOCK_V1 |
+                        FLEXE_TARGET_CAP_IO_MUX_V1 |
+                        FLEXE_TARGET_CAP_RTC_CNTL_V1 |
+                        FLEXE_TARGET_CAP_RTC_IO_V1 |
+                        FLEXE_TARGET_CAP_EFUSE_READ_V1 |
+                        FLEXE_TARGET_CAP_GPIO_V1 |
+                        FLEXE_TARGET_CAP_I2C_V1 |
+                        FLEXE_TARGET_CAP_SENS_V1 |
+                        FLEXE_TARGET_CAP_RADIO_REGS_V1 |
+                        FLEXE_TARGET_CAP_GDMA_V1 |
+                        FLEXE_TARGET_CAP_SHA_V1 |
+                        FLEXE_TARGET_CAP_AES_V1 |
+                        FLEXE_TARGET_CAP_GP_SPI |
+                        FLEXE_TARGET_CAP_RMT_V1 |
+                        FLEXE_TARGET_CAP_LEDC_V1 |
+                        FLEXE_TARGET_CAP_SYSCON_MEMORY_V1 |
+                        FLEXE_TARGET_CAP_ASSIST_DEBUG_V1 |
+                        FLEXE_TARGET_CAP_APB_SARADC_V1 |
+                        FLEXE_TARGET_CAP_I2S_V2 |
+                        FLEXE_TARGET_CAP_SDMMC_HOST_V1 |
+                        FLEXE_TARGET_CAP_TWAI_V1 |
+                        FLEXE_TARGET_CAP_PCNT_V1 |
+                        FLEXE_TARGET_CAP_MCPWM_V1 |
+                        FLEXE_TARGET_CAP_LCD_CAM_V1 |
+                        FLEXE_TARGET_CAP_TOUCH_V2 |
+                        FLEXE_TARGET_CAP_ROM_FLASH_HANDOFF,
+        .reset_vector = 0x40000400u,
+        .vecbase_reset = 0x40000000u,
+        .configid0 = 0xC2F0FFFEu,
+        .configid1 = 0x23090F1Fu,
+        .default_cpu_frequency_mhz = 160u,
+        .cpu_frequency_word = 0x3FCEF758u,
+        /* ESP32-S3 rev-0 ROM linker symbols __stack and __stack_app.
+         * Application handoff still runs the PRO/APP startup paths before
+         * FreeRTOS installs task stacks, so both cores need the ROM-owned
+         * 8-KiB startup ranges. 0x3FCED710 and above is ROM static state;
+         * placing APP_CPU at the old 0x3FCF0000 boundary let its first LX7
+         * window spill overwrite the ROM ABI interface immediately below. */
+        .bootstrap_stack_top = { 0x3FCEB710u, 0x3FCED710u },
+        .interrupt_level = {
+            1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 3, 1, 1, 7, 3,
+            5, 1, 1, 2, 2, 2, 3, 3,
+            4, 4, 5, 3, 4, 3, 4, 5,
+        },
+        .iram_start = 0x40370000u,
+        .iram_end = 0x403E0000u,
+        .dram_start = 0x3FC88000u,
+        .dram_end = 0x3FD00000u,
+        .drom_start = 0x3C000000u,
+        .drom_end = 0x3E000000u,
+        .irom_start = 0x42000000u,
+        .irom_end = 0x44000000u,
+        .default_app_offset = 0x00010000u,
+        .partition_table_offset = 0x00008000u,
+        .flash_mmu = {
+            .page_size = 0x00010000u,
+            .entry_count = 512,
+            .linear_addr_mask = 0x01FFFFFFu,
+            .table_base = { 0x600C5000u, 0 },
+            .invalid_entry = 0x00004000u,
+            .invalid_mask = 0x00004000u,
+            .physical_page_mask = 0x00003FFFu,
+            .target_mask = 0x00008000u,
+            .shared_instruction_data = true,
+        },
+        .cache_control_base = 0x600C4000u,
+        .cache_control_size = 0x00001000u,
+        .uart_count = 3,
+        .uart_ip = {
+            .register_size = 0x100u,
+            .interrupt_valid_mask = 0x000FFFFFu,
+            .interrupt_raw_reset = 1u << 1,
+            .status_idle_value = (1u << 14) | (1u << 15) |
+                                 (1u << 29) | (1u << 30) | (1u << 31),
+            .rx_full_threshold_mask = 0x3FFu,
+            .rx_timeout_enable_mask = 1u << 23,
+            .mem_rx_status_offset = 0x68u,
+            .fifo_address_mask = 0x3FFu,
+            .mem_rx_read_shift = 0u,
+            .mem_rx_write_shift = 11u,
+            .date_offset = 0x7Cu,
+            .date_reset = 0x02008270u,
+        },
+        .uart = {
+            { .base = 0x60000000u, .interrupt_source = 27u,
+              .tx_output_signal = 12u },
+            { .base = 0x60010000u, .interrupt_source = 28u,
+              .tx_output_signal = 15u },
+            { .base = 0x6002E000u, .interrupt_source = 29u,
+              .tx_output_signal = 18u },
+        },
+        .i2c = {
+            .register_size = 0x184u,
+            .date_reset = 0x20070201u,
+            .interrupt_valid_mask = 0x0003FFFFu,
+            .interrupt_rxfifo_full_mask = 1u << 0,
+            .interrupt_txfifo_empty_mask = 1u << 1,
+            .interrupt_rxfifo_overflow_mask = 1u << 2,
+            .interrupt_end_detect_mask = 1u << 3,
+            .interrupt_command_done_mask = 1u << 4,
+            .interrupt_transaction_complete_mask = 1u << 7,
+            .interrupt_transaction_start_mask = 1u << 9,
+            .interrupt_nack_mask = 1u << 10,
+            .instance_count = 2u,
+            .command_count = 8u,
+            /* ESP32-S3's HAL command encoding is 6/1/3/2/4, unlike the
+             * classic ESP32's otherwise similar FIFO command front end. */
+            .opcode_restart = 6u,
+            .opcode_write = 1u,
+            .opcode_read = 3u,
+            .opcode_stop = 2u,
+            .opcode_end = 4u,
+            .instance = {
+                { .base = 0x60013000u, .interrupt_source = 42u,
+                  .scl_output_signal = 89u, .sda_output_signal = 90u },
+                { .base = 0x60027000u, .interrupt_source = 43u,
+                  .scl_output_signal = 91u, .sda_output_signal = 92u },
+            },
+        },
+        .sdmmc_host = {
+            .base = 0x60028000u,
+            .register_size = 0x1000u,
+            .version_reset = 0x5342240Au,
+            .interrupt_source = 30u,
+            .slot_count = 2u,
+            .slot = {
+                {
+                    .clock_output_signal = 172u,
+                    .command_io_signal = 178u,
+                    .data_io_signal = {
+                        180u, 181u, 182u, 183u,
+                        184u, 185u, 186u, 187u,
+                    },
+                    .data_signal_count = 8u,
+                },
+                {
+                    .clock_output_signal = 173u,
+                    .command_io_signal = 179u,
+                    .data_io_signal = {
+                        213u, 214u, 215u, 216u,
+                        217u, 218u, 219u, 220u,
+                    },
+                    .data_signal_count = 8u,
+                },
+            },
+        },
+        .twai = {
+            .base = 0x6002B000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = 80000000u,
+            .bus_timing_0_writable_mask = 0x0000DFFFu,
+            .brp_mask = 0x00001FFFu,
+            .clock_divider_writable_mask = 0x000001FFu,
+            .tx_output_signal = 116u,
+            .rx_input_signal = 116u,
+            .bus_off_output_signal = 117u,
+            .clock_output_signal = 118u,
+            .interrupt_source = 37u,
+            .interrupt_enable_writable_mask = 0xEFu,
+        },
+        .pcnt = {
+            .base = 0x60017000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = 80000000u,
+            .conf0_reset = 0x00003C10u,
+            .control_reset = 0x00000055u,
+            .control_writable_mask = 0x000100FFu,
+            .date_reset = 0x19072601u,
+            .conf_stride = 0x00Cu,
+            .count_offset = 0x030u,
+            .interrupt_raw_offset = 0x040u,
+            .interrupt_status_offset = 0x044u,
+            .interrupt_enable_offset = 0x048u,
+            .interrupt_clear_offset = 0x04Cu,
+            .unit_status_offset = 0x050u,
+            .control_offset = 0x060u,
+            .date_offset = 0x0FCu,
+            .pulse_input_signal = {
+                { 33u, 34u }, { 37u, 38u },
+                { 41u, 42u }, { 45u, 46u },
+            },
+            .control_input_signal = {
+                { 35u, 36u }, { 39u, 40u },
+                { 43u, 44u }, { 47u, 48u },
+            },
+            .unit_count = 4u,
+            .channel_count = 2u,
+            .interrupt_source = 41u,
+        },
+        .mcpwm = {
+            .base = { 0x6001E000u, 0x6002C000u },
+            .register_size = 0x1000u,
+            .source_clock_hz = 160000000u,
+            .capture_clock_hz = 80000000u,
+            .version_reset = 0x02107230u,
+            .output_signal = {
+                { { 160u, 161u }, { 162u, 163u }, { 164u, 165u } },
+                { { 166u, 167u }, { 168u, 169u }, { 170u, 171u } },
+            },
+            .sync_input_signal = {
+                { 160u, 161u, 162u }, { 169u, 170u, 171u },
+            },
+            .fault_input_signal = {
+                { 163u, 164u, 165u }, { 172u, 173u, 174u },
+            },
+            .capture_input_signal = {
+                { 166u, 167u, 168u }, { 175u, 176u, 177u },
+            },
+            .group_count = 2u,
+            .interrupt_source = { 31u, 32u },
+        },
+        .secondary_core = {
+            .base = 0x600C0000u,
+            .register_size = 0x1000u,
+            .control_offset = 0x000u,
+            .boot_address_offset = 0x004u,
+            .control_reset = 1u << 2,
+            .reset_mask = 1u << 2,
+            .clock_gate_mask = 1u << 1,
+            .runstall_mask = 1u << 0,
+        },
+        .system_clock = {
+            .base = 0x600C0000u,
+            .register_size = 0x1000u,
+            .cpu_per_conf_offset = 0x010u,
+            .cpu_per_conf_reset = 0x0000000Cu,
+            .cpu_per_conf_writable_mask = 0x000000FFu,
+            .sysclk_conf_offset = 0x060u,
+            .sysclk_conf_reset = 0x00000001u,
+            .sysclk_conf_writable_mask = 0x00000FFFu,
+            .register_count = 8u,
+            .gate_count = 24u,
+            .reg = {
+                { .offset = 0x014u, .reset = 0x00000001u,
+                  .writable_mask = 0x00000001u },
+                { .offset = 0x018u, .reset = 0xF9C1E06Fu,
+                  .writable_mask = UINT32_MAX },
+                { .offset = 0x01Cu, .reset = 0x00000600u,
+                  .writable_mask = 0x000007FFu },
+                { .offset = 0x020u, .reset = 0x00000000u,
+                  .writable_mask = UINT32_MAX },
+                { .offset = 0x024u, .reset = 0x000001FEu,
+                  .writable_mask = 0x000007FFu },
+                { .offset = 0x028u, .reset = 0x000000FFu,
+                  .writable_mask = 0x00000FFFu },
+                { .offset = 0x02Cu, .reset = 0x02001001u,
+                  .writable_mask = 0x1FFFFFFFu },
+                /* External-memory DMA clock/reset control. */
+                { .offset = 0x044u, .reset = 0x00000001u,
+                  .writable_mask = 0x00000003u },
+            },
+            .gate = {
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_SYSTIMER,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 29,
+                    .reset_mask = 1u << 29,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_TIMER_GROUP,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 13,
+                    .reset_mask = 1u << 13,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_TIMER_GROUP,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 15,
+                    .reset_mask = 1u << 15,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_I2C,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 7,
+                    .reset_mask = 1u << 7,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_I2C,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 18,
+                    .reset_mask = 1u << 18,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_GP_SPI,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 6,
+                    .reset_mask = 1u << 6,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_GP_SPI,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 16,
+                    .reset_mask = 1u << 16,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_SHA,
+                    .instance = 0u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 2,
+                    .reset_mask = 1u << 2,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_LEDC,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 11,
+                    .reset_mask = 1u << 11,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_UART,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 2,
+                    .reset_mask = 1u << 2,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_UART,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 5,
+                    .reset_mask = 1u << 5,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_UART,
+                    .instance = 2u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 9,
+                    .reset_mask = 1u << 9,
+                },
+                {
+                    /* S3 usb_serial_jtag_ll uses SYSTEM_USB_DEVICE for USJ. */
+                    .device = FLEXE_SYSTEM_DEVICE_USB_SERIAL_JTAG,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 10,
+                    .reset_mask = 1u << 10,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_EDMA,
+                    .clock_offset = 0x044u,
+                    .reset_offset = 0x044u,
+                    .clock_mask = 1u << 0,
+                    .reset_mask = 1u << 1,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_I2S,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 4,
+                    .reset_mask = 1u << 4,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_I2S,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 21,
+                    .reset_mask = 1u << 21,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_SDMMC,
+                    .instance = 0u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 7,
+                    .reset_mask = 1u << 7,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_TWAI,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 19,
+                    .reset_mask = 1u << 19,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_PCNT,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 10,
+                    .reset_mask = 1u << 10,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_AES,
+                    .instance = 0u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 1,
+                    .reset_mask = 1u << 1,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_MCPWM,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 17,
+                    .reset_mask = 1u << 17,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_MCPWM,
+                    .instance = 1u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 20,
+                    .reset_mask = 1u << 20,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_LCD_CAM,
+                    .instance = 0u,
+                    .clock_offset = 0x01Cu,
+                    .reset_offset = 0x024u,
+                    .clock_mask = 1u << 8,
+                    .reset_mask = 1u << 8,
+                },
+                {
+                    .device = FLEXE_SYSTEM_DEVICE_APB_SARADC,
+                    .instance = 0u,
+                    .clock_offset = 0x018u,
+                    .reset_offset = 0x020u,
+                    .clock_mask = 1u << 28,
+                    .reset_mask = 1u << 28,
+                },
+            },
+            .low_power = {
+                .memory_power_down_offset = 0x014u,
+                .divider_integer_offset = 0x028u,
+                .divider_fraction_offset = 0x02Cu,
+                .memory_power_down_inhibit_mask = 1u << 0,
+                .divider_integer_mask = 0x00000FFFu,
+                .divider_a_mask = 0x00FFF000u,
+                .divider_b_mask = 0x00000FFFu,
+                .source_rtc_slow_mask = 1u << 24,
+                .source_internal_mask = 1u << 25,
+                .source_xtal_mask = 1u << 26,
+                .source_xtal32k_mask = 1u << 27,
+                .rtc_clock_enable_mask = 1u << 28,
+            },
+            .peripheral_banks = {
+                .bank_count = 2u,
+                .clock_offset = { 0x018u, 0x01Cu },
+                .reset_offset = { 0x020u, 0x024u },
+                .valid_mask = { UINT32_MAX, 0x000007FFu },
+            },
+        },
+        .io_mux = {
+            .base = 0x60009000u,
+            .register_size = 0x1000u,
+            .register_count = 64u,
+            .gpio_count = 49u,
+            .function_shift = 12u,
+            .control_offset = 0u,
+            .control_reset = 0u,
+            .control_writable_mask = 0x0000FFFFu,
+            .register_reset = 0u,
+            .register_writable_mask = 0x0000FFFFu,
+            .function_mask = 0x00007000u,
+            .input_enable_mask = 1u << 9u,
+            .date_offset = 0x0FCu,
+            .date_reset = 0x01907160u,
+            .gpio_register_offset = {
+                0x004u, 0x008u, 0x00Cu, 0x010u, 0x014u,
+                0x018u, 0x01Cu, 0x020u, 0x024u, 0x028u,
+                0x02Cu, 0x030u, 0x034u, 0x038u, 0x03Cu,
+                0x040u, 0x044u, 0x048u, 0x04Cu, 0x050u,
+                0x054u, 0x058u,
+                FLEXE_TARGET_IO_MUX_OFFSET_NONE,
+                FLEXE_TARGET_IO_MUX_OFFSET_NONE,
+                FLEXE_TARGET_IO_MUX_OFFSET_NONE,
+                FLEXE_TARGET_IO_MUX_OFFSET_NONE,
+                0x06Cu, 0x070u, 0x074u, 0x078u, 0x07Cu,
+                0x080u, 0x084u, 0x088u, 0x08Cu, 0x090u,
+                0x094u, 0x098u, 0x09Cu, 0x0A0u, 0x0A4u,
+                0x0A8u, 0x0ACu, 0x0B0u, 0x0B4u, 0x0B8u,
+                0x0BCu, 0x0C0u, 0x0C4u,
+            },
+        },
+        .gpio = {
+            .base = 0x60004000u,
+            .register_size = 0x1000u,
+            /* ESP32-S3 has GPIO0..48 with package holes at GPIO22..25. */
+            .valid_gpio_mask = UINT64_C(0x0001FFFFFC3FFFFF),
+            .strap_reset = 0u,
+            .date_reset = 0x01907040u,
+            .gpio_count = 49u,
+            .matrix_const_one_input = 0x38u,
+            .matrix_const_zero_input = 0x3Cu,
+            .interrupt_source = 16u,
+            .nmi_interrupt_source = 17u,
+        },
+        .rtc_cntl = {
+            .base = 0x60008000u,
+            .register_size = 0x1000u,
+            .store_count = 8u,
+            .slow_clock_cal_store = 1u,
+            .xtal_frequency_store = 4u,
+            .slow_clock_hz = 136000u,
+            .xtal_frequency_mhz = 40u,
+            .store_offset = {
+                0x050u, 0x054u, 0x058u, 0x05Cu,
+                0x0C0u, 0x0C4u, 0x0C8u, 0x0CCu,
+            },
+            .time_update_offset = 0x00Cu,
+            .time_low_offset = 0x010u,
+            .time_high_offset = 0x014u,
+            .reset_state_offset = 0x038u,
+            .cpu_stall_options_offset = 0x000u,
+            .cpu_stall_high_offset = 0x0BCu,
+            .cpu_stall_options_reset = 0x1C00A000u,
+            .cpu_stall_options_writable_mask = 0x7F83FFCFu,
+            .cpu_stall_low_shift = { 2u, 0u },
+            .cpu_stall_high_shift = { 26u, 20u },
+            .software_reset_cpu0_mask = 1u << 5,
+            .software_reset_cpu1_mask = 1u << 4,
+            .software_reset_system_mask = 1u << 31,
+            .options_xtal_wait_mask = 0xFu << 14,
+            .options_xtal_wait_shift = 14u,
+            /* Crystal, BBPLL, BBPLL-I2C, and baseband-I2C supplies. */
+            .options_supply_count = 4u,
+            .options_supply = {
+                { 1u << 13, 1u << 12 },
+                { 1u << 11, 1u << 10 },
+                { 1u << 9, 1u << 8 },
+                { 1u << 7, 1u << 6 },
+            },
+            /* Analog top, PLL, and crystal isolation. */
+            .options_isolation_count = 3u,
+            .options_isolation = {
+                { 1u << 28, 1u << 25 },
+                { 1u << 27, 1u << 24 },
+                { 1u << 26, 1u << 23 },
+            },
+            /* Digital-wrapper reset. */
+            .options_reset_count = 1u,
+            .options_reset = {
+                { 1u << 30, 1u << 29 },
+            },
+            .clock_conf_offset = 0x074u,
+            .slow_clock_select_shift = 30u,
+            .time_update_mask = 0x80000000u,
+            .time_high_mask = 0x0000FFFFu,
+            /* PRO/APPCPU state-vector selection reset bits plus a power-on
+             * reset cause in each six-bit core field. */
+            .reset_state_reset = 0x00003041u,
+            .clock_conf_reset = 0x1158321Cu,
+            .clock_conf_writable_mask = 0xFFFFF7FEu,
+            .slow_clock_select_mask = 0xC0000000u,
+            /* RC_SLOW, XTAL32K, and RC_FAST/256 nominal frequencies. The
+             * fourth mux encoding is reserved by the S3 clock-tree HAL. */
+            .slow_clock_source_hz = {
+                136000u, 32768u, 68359u, 0u,
+            },
+            .fast_clock_select_mask = 1u << 29,
+            /* ESP32-S3 RTC_FAST_CLK selects XTAL/2 or nominal RC_FAST. */
+            .fast_clock_source_hz = { 20000000u, 17500000u },
+            /* RTC_CNTL_REG: RTC LDO and digital boost force pairs are
+             * functional. SCK_DCAP and DIG_CAL retain their values as
+             * diagnostic analog controls. */
+            .regulator_offset = 0x084u,
+            .regulator_reset = 0xA0000000u,
+            .regulator_writable_mask = 0xF03FC080u,
+            .regulator_supply_count = 2u,
+            .regulator_supply = {
+                { 1u << 31, 1u << 30 }, /* RTC regulator */
+                { 1u << 29, 1u << 28 }, /* digital boost */
+            },
+            .analog_conf_offset = 0x034u,
+            /* RTC_CNTL_ANA_CONF reset: SAR_I2C_PU and
+             * I2C_RESET_POR_FORCE_PD are set on S3 revision 0. */
+            .analog_conf_reset = (1u << 22) | (1u << 18),
+            .analog_conf_writable_mask =
+                (1u << 31) | (1u << 30) | (1u << 29) | (1u << 28) |
+                (1u << 27) |
+                (1u << 26) | (1u << 25) | (1u << 24) | (1u << 23) |
+                (1u << 22) | (1u << 20) | (1u << 19) | (1u << 18),
+            /* PLL-I2C, CKGEN-I2C, ROM-private I2C power, RFRX-PBUS,
+             * TXRF-I2C, PVTMON, BBPLL sleep calibration, analog-top
+             * monitor/sleep isolation, SAR-I2C, and glitch reset enable.
+             * Revision-0 ROM's rom_open_i2c_xpd explicitly sets bit 29;
+             * the public register header leaves that silicon control
+             * unnamed, so it remains target data instead of a guest-PC
+             * special case. */
+            .analog_control_count = 11u,
+            .analog_control_mask = {
+                1u << 31, 1u << 30, 1u << 29, 1u << 28,
+                1u << 27, 1u << 26, 1u << 25, 1u << 24,
+                1u << 23, 1u << 22, 1u << 20,
+            },
+            .analog_reset_por_supply = { 1u << 19, 1u << 18 },
+            .sar_i2c_power_mask = 1u << 22,
+            /* RTC_CNTL_USB_CONF_REG: the default eFuse route attaches the
+             * internal FSLS PHY to USB Serial/JTAG. */
+            .usb_conf_offset = 0x120u,
+            .usb_conf_reset = 0u,
+            .usb_conf_writable_mask = (1u << 20) | (1u << 19),
+            .usb_phy_override_mask = 1u << 20,
+            .usb_phy_select_mask = 1u << 19,
+            /* DATE[18:13] doubles as the six-bit LDO-slave trim field. */
+            .date_offset = 0x1FCu,
+            .date_reset = 0x02101271u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            .interrupt_enable_offset = 0x040u,
+            .interrupt_raw_offset = 0x044u,
+            .interrupt_status_offset = 0x048u,
+            .interrupt_clear_offset = 0x04Cu,
+            .interrupt_enable_set_offset = 0x138u,
+            .interrupt_enable_clear_offset = 0x13Cu,
+            .interrupt_enable_reset = 0u,
+            .interrupt_raw_reset = 0u,
+            .interrupt_valid_mask = 0x001FFFFFu,
+            /* TOUCH_APPROACH_LOOP_DONE is the sole software-writable raw
+             * source on S3; device producers update all valid raw bits
+             * through the controller API. */
+            .interrupt_raw_writable_mask = 1u << 20,
+            .interrupt_source = 39u,
+            .wdt_config_offset = {
+                0x098u, 0x09Cu, 0x0A0u, 0x0A4u, 0x0A8u,
+            },
+            .wdt_feed_offset = 0x0ACu,
+            .wdt_write_protect_offset = 0x0B0u,
+            .wdt_config_reset = {
+                0x00013214u, 200000u, 80000u, 0xFFFu, 0xFFFu,
+            },
+            .wdt_config_writable_mask = {
+                UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                UINT32_MAX, UINT32_MAX,
+            },
+            .wdt_enable_mask = 1u << 31,
+            .wdt_flashboot_enable_mask = 1u << 12,
+            .wdt_pause_in_sleep_mask = 1u << 9,
+            .wdt_auxiliary_control_mask = 0x0007EDFFu,
+            .wdt_feed_mask = 1u << 31,
+            .wdt_write_protect_key = 0x50D83AA1u,
+            .wdt_interrupt_mask = 1u << 3,
+            .wdt_stage_action_shift = { 28u, 25u, 22u, 19u },
+            .wdt_stage_action_mask = 0x7u,
+            /* Revision-0 WDT_DELAY_SEL is zero, making stage 0 count two
+             * slow-clock ticks for each stored hold unit. */
+            .wdt_stage0_multiplier = 2u,
+            /* RTC_CNTL_PAD_HOLD_REG maps GPIO0..21 to bits 0..21. */
+            .rtc_pad_hold_offset = 0x0D8u,
+            .rtc_pad_hold_first_gpio = 0u,
+            .rtc_pad_hold_first_bit = 0u,
+            .rtc_pad_hold_count = 22u,
+            /* ESP32-S3 gpio_periph.c maps GPIO22..48 to bits 1..27 of
+             * RTC_CNTL_DIG_PAD_HOLD_REG; GPIO22..25 are unbonded. */
+            .digital_pad_hold_offset = 0x0DCu,
+            .digital_pad_hold_first_gpio = 22u,
+            .digital_pad_hold_first_bit = 1u,
+            .digital_pad_hold_count = 27u,
+            /* ESP32-S3 rtc_cntl_reg.h and rtc_cntl_ll.h. Timer/EXT wake
+             * execute; the other wake sources stay diagnostic. */
+            .sleep_timer_low_offset = 0x004u,
+            .sleep_timer_high_offset = 0x008u,
+            .sleep_state_offset = 0x018u,
+            /* ESP-IDF v5.5.1 esp32s3 rtc_cntl_reg.h TIMER1..TIMER6:
+             * all fields use their documented power-on values. TIMER5 has
+             * only the eight writable MIN_SLP_VAL bits. */
+            .sequence_register_count = 6u,
+            .sequence_register = {
+                { 0x01Cu, 0x28140403u, UINT32_MAX },
+                { 0x020u, 0x01080000u, 0xFFFF8000u },
+                { 0x024u, 0x14160A08u, UINT32_MAX },
+                { 0x028u, 0x10200A08u, UINT32_MAX },
+                { 0x02Cu, 0x00008000u, 0x0000FF00u },
+                { 0x030u, 0x10200A08u, UINT32_MAX },
+            },
+            /* Remaining RTC sleep-path and touch-v2 configuration.
+             * Functional mode keeps analog bias/drive values as exact state
+             * while collapsing their electrical voltage and settling time.
+             * The touch engine consumes the digital controls below. */
+            .config_register_count = 14u,
+            .config_register = {
+                /* SLP_REJECT_CONF */
+                { 0x068u, 0x00000000u, 0xFFFFF000u,
+                  0x00000000u, 0xFFFFF000u, 0u },
+                /* SDIO_CONF; REG1P8_READY is physically read-only. */
+                { 0x07Cu, 0x0AB0BE0Au, 0xFEFFFEFFu,
+                  0x01000000u, 0xFEFFFEFFu, 0u },
+                /* BIAS_CONF */
+                { 0x080u, 0x00010800u, 0x3FFFFC00u,
+                  0x00000000u, 0x3FFFFC00u, 0u },
+                /* REGULATOR_DRV_CTRL */
+                { 0x08Cu, 0x00000000u, 0x0FFFFFFFu,
+                  0x00000000u, 0x0FFFFFFFu, 0u },
+                /* TOUCH_CTRL1: measurement and inter-scan lengths. */
+                { 0x108u, 0x10000100u, UINT32_MAX,
+                  0x00000000u, UINT32_MAX, 0u },
+                /* TOUCH_CTRL2 */
+                { 0x10Cu, 0x000840CCu, 0xFFFFFFFCu,
+                  0x00000000u, 0xFFFFFFFCu, 0u },
+                /* TOUCH_SCAN_CTRL */
+                { 0x110u, 0xF0000102u, 0xFFFFFF07u,
+                  0x00000000u, 0xFFFFFF07u, 0u },
+                /* TOUCH_SLP_THRES */
+                { 0x114u, 0x78000000u, 0xFC3FFFFFu,
+                  0x00000000u, 0xFC3FFFFFu, 0u },
+                /* TOUCH_APPROACH; SLP_CHANNEL_CLR is a write strobe. */
+                { 0x118u, 0x50000000u, 0xFF800000u,
+                  0x00000000u, 0xFF800000u, 1u << 23 },
+                /* TOUCH_FILTER_CTRL */
+                { 0x11Cu, 0x96AA8800u, 0xFFFFFF80u,
+                  0x00000000u, 0xFFFFFF80u, 0u },
+                /* TOUCH_TIMEOUT_CTRL */
+                { 0x124u, 0x007FFFFFu, 0x007FFFFFu,
+                  0x00000000u, 0x007FFFFFu, 0u },
+                /* FIB_SEL: software ownership for power-glitch, brownout,
+                 * and super-watchdog reset paths. Detector injection is a
+                 * separate capability from retaining this selector. */
+                { 0x148u, 0x00000007u, 0x00000007u,
+                  0x00000000u, 0x00000007u, 0u },
+                /* TOUCH_DAC / TOUCH_DAC1 per-channel slope fields. */
+                { 0x14Cu, 0x00000000u, 0xFFFFFFFCu,
+                  0x00000000u, 0xFFFFFFFCu, 0u },
+                { 0x150u, 0x00000000u, 0xFFFE0000u,
+                  0x00000000u, 0xFFFE0000u, 0u },
+            },
+            .cpu_stall_enable_offset = 0x01Cu,
+            .cpu_stall_enable_mask = 1u,
+            .wakeup_state_offset = 0x03Cu,
+            .digital_power_offset = 0x090u,
+            .wakeup_cause_offset = 0x130u,
+            /* RTC_CNTL_PWC_REG: RTC peripheral and memory domains share the
+             * register with the global RTCIO pad hold. */
+            .rtc_power_offset = 0x088u,
+            .rtc_power_reset = 0x00000925u,
+            .rtc_power_writable_mask = 0x003C0FFFu,
+            .rtc_pad_force_hold_mask = 1u << 21,
+            .rtc_power_domain_count = 3u,
+            /* CPU top / SRAM4 is digital_domain[2]. */
+            .rtc_follow_cpu_domain = 3u,
+            .rtc_power_domain = {
+                { 1u << 20, 1u << 19, 1u << 18, 0u,
+                  1u << 5, 1u << 4 }, /* RTC peripheral */
+                { 0u, 1u << 11, 1u << 10, 1u << 9,
+                  1u << 2, 1u << 3 }, /* RTC slow memory */
+                { 0u, 1u << 8, 1u << 7, 1u << 6,
+                  1u << 0, 1u << 1 }, /* RTC fast memory */
+            },
+            /* RTC_CNTL_DIG_ISO_REG: digital pads use a separate global
+             * force-hold source and force-unhold override. */
+            .digital_iso_offset = 0x094u,
+            .digital_iso_reset = 0xAA805080u,
+            .digital_iso_writable_mask = 0xFFC0FD80u,
+            .digital_iso_read_only_mask = 1u << 9,
+            .digital_iso_strobe_mask = 1u << 10,
+            .digital_pad_force_hold_mask = 1u << 15,
+            .digital_pad_force_unhold_mask = 1u << 14,
+            .digital_pad_isolation = { 1u << 12, 1u << 13 },
+            .digital_pad_autohold_enable_mask = 1u << 11,
+            .digital_isolation = { 1u << 7, 1u << 8 },
+            .digital_power_reset = 0x00545010u,
+            .digital_power_writable_mask = 0xF07E7818u,
+            /* DIG_PWC/DIG_ISO domains in hardware register order. Radio
+             * windows reference these entries by one-based index. */
+            .digital_domain_count = 6u,
+            .digital_domain = {
+                { 1u << 31, 1u << 20, 1u << 19,
+                  1u << 31, 1u << 30 }, /* digital wrapper */
+                { 1u << 30, 1u << 18, 1u << 17,
+                  1u << 29, 1u << 28 }, /* Wi-Fi */
+                { 1u << 29, 1u << 22, 1u << 21,
+                  1u << 27, 1u << 26 }, /* CPU top / SRAM4 */
+                { 1u << 28, 1u << 14, 1u << 13,
+                  1u << 25, 1u << 24 }, /* digital peripheral / SRAM3 */
+                { 0u, 1u << 12, 1u << 11,
+                  1u << 23, 1u << 22 }, /* Bluetooth / SRAM2 */
+                { 0u, 1u << 4, 1u << 3,
+                  0u, 0u },             /* light-sleep digital memory */
+            },
+            .sleep_enable_mask = 1u << 31,
+            .sleep_wakeup_mask = 1u << 29,
+            .sleep_alarm_enable_mask = 1u << 16,
+            .sleep_alarm_interrupt_mask = 1u << 10,
+            .digital_wrap_power_down_mask = 1u << 31,
+            .timer_wakeup_mask = 1u << 3,
+            .ext0_wakeup_mask = 1u,
+            .ext1_wakeup_mask = 1u << 1,
+            .ext_wakeup_config_offset = 0x064u,
+            .ext1_select_offset = 0x0E0u,
+            .ext1_status_offset = 0x0E4u,
+            /* rtc_cntl_reg.h: the S3 brownout comparator observes a
+             * nominal host supply unless voltage injection is modeled. */
+            .brownout_offset = 0x0E8u,
+            .brownout_reset = 0x43FF0010u,
+            .brownout_writable_mask = 0x5FFFFFF0u,
+            .brownout_detect_mask = 1u << 31,
+            .brownout_count_clear_mask = 1u << 29,
+            .ext0_wakeup_level_mask = 1u << 30,
+            .ext1_wakeup_level_mask = 1u << 31,
+            .ext1_select_mask = 0x003FFFFFu,
+            .ext1_status_clear_mask = 1u << 22,
+            .sleep_wakeup_interrupt_mask = 1u,
+            .wakeup_valid_mask = 0x1FFFFu,
+            .wakeup_enable_reset = 0xCu,
+            .wakeup_enable_shift = 15u,
+        },
+        .rtc_io = {
+            .base = 0x60008400u,
+            .register_size = 0x200u,
+            .gpio_count = 22u,
+            .data_shift = 10u,
+            .pin_base_offset = 0x028u,
+            .pin_writable_mask = 0x00000784u,
+            .pad_base_offset = 0x084u,
+            .pad_mux_mask = 1u << 19,
+            .ext0_select_offset = 0x0DCu,
+            .ext0_select_shift = 27u,
+            .ext0_select_width = 5u,
+            /* esp32s3 rtc_io_reg.h: all pads reset to drive strength 2.
+             * Package pull defaults differ: GPIO0/2/4/5/19..21 down,
+             * GPIO1/3/6 up, and the other RTC pads float. */
+            .pad_reset = {
+                0x50000000u, 0x48000000u, 0x50000000u,
+                0x48000000u, 0x50000000u, 0x50000000u,
+                0x48000000u, 0x40000000u, 0x40000000u,
+                0x40000000u, 0x40000000u, 0x40000000u,
+                0x40000000u, 0x40000000u, 0x40000000u,
+                0x40000000u, 0x40000000u, 0x40000000u,
+                0x40000000u, 0x50000000u, 0x50000000u,
+                0x50000000u,
+            },
+        },
+        .efuse = {
+            .base = 0x60007000u,
+            .register_size = 0x1000u,
+            .read_data_offset = 0x02Cu,
+            .read_data_word_count = 84u,
+            .date_offset = 0x1FCu,
+            .date_reset = 0x02101290u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            /* ESP32-S3 revision 0.0, no embedded flash/PSRAM, and the
+             * locally administered unicast MAC 02:00:00:00:00:01. */
+            .read_data = {
+                [6] = 0x00000001u, /* RD_MAC_SPI_SYS_0: MAC bits 31:0 */
+                [7] = 0x00000200u, /* RD_MAC_SPI_SYS_1: MAC bits 47:32 */
+            },
+        },
+        .interrupt_matrix = {
+            .base = 0x600C2000u,
+            .register_size = 0x1000u,
+            .source_count = 99u,
+            .map_offset = { 0x000u, 0x800u },
+            .status_offset = { 0x18Cu, 0x98Cu },
+            .clock_gate_offset = { 0x19Cu, 0x99Cu },
+            .date_offset = { 0x7FCu, 0xFFCu },
+            .map_reset = 16u,
+            .map_writable_mask = 0x1Fu,
+            .clock_gate_reset = 1u,
+            .clock_gate_writable_mask = 1u,
+            .date_reset = 0x02012300u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            .software_interrupt_base = 0x600C0000u,
+            .software_interrupt_offset = 0x030u,
+            .software_interrupt_stride = 4u,
+            .software_interrupt_source_base = 79u,
+            .software_interrupt_count = 4u,
+            .software_interrupt_writable_mask = 1u,
+        },
+        .rtc_calibration = {
+            .group_count = 2,
+            .base = { 0x6001F000u, 0x60020000u },
+            .register_size = 0x1000u,
+            .config_offset = 0x068u,
+            .value_offset = 0x06Cu,
+            .timeout_offset = 0x080u,
+            .config_reset = 0x00013000u,
+            .timeout_reset = 0xFFFFFF98u,
+            .config_writable_mask = 0xFFFF7000u,
+            .timeout_writable_mask = 0xFFFFFFF8u,
+            .start_mask = 1u << 31,
+            .cycling_mask = 1u << 12,
+            .ready_mask = 1u << 15,
+            .timeout_mask = 1u << 0,
+            .cycles_mask = 0x7FFFu << 16,
+            .clock_select_mask = 3u << 13,
+            .result_mask = 0x01FFFFFFu << 7,
+            .cycles_shift = 16,
+            .clock_select_shift = 13,
+            .result_shift = 7,
+            .reference_clock_hz = 40000000u,
+            /* ESP-IDF's nominal RC_SLOW, RC_FAST/256, XTAL32K, and
+             * INTERNAL_OSC selections for ESP32-S3 functional mode. */
+            .source_clock_hz = { 136000u, 68359u, 32768u, 136000u },
+        },
+        .regi2c = {
+            .base = 0x6000E000u,
+            .register_size = 0x1000u,
+            .host_count = 2,
+            .command_offset = 0x000u,
+            .command_stride = 0x004u,
+            .analog_control_offset = 0x040u,
+            .config_offset = 0x044u,
+            .config2_offset = 0x048u,
+            .analog_control_writable_mask = (1u << 2) | (1u << 3),
+            .config_writable_mask = UINT32_MAX,
+            .config2_writable_mask = UINT32_MAX,
+            .command_start_mask = 1u << 26,
+            .command_busy_mask = 1u << 25,
+            .command_write_mask = 1u << 24,
+            .slave_mask = 0xFFu,
+            .address_mask = 0xFFu << 8,
+            .data_mask = 0xFFu << 16,
+            .slave_shift = 0,
+            .address_shift = 8,
+            .data_shift = 16,
+            .bbpll_stop_high_mask = 1u << 2,
+            .bbpll_stop_low_mask = 1u << 3,
+            .bbpll_done_mask = 1u << 24,
+            .aux_register_count = 2u,
+            .aux_register = {
+                /* PHY TX-DC calibration command/result. Bit 24 reports
+                 * completion; fast mode resolves the conversion immediately
+                 * while retaining the 24-bit software command payload. */
+                { 0x04Cu, 0x01000000u, 0x00FFFFFFu },
+                /* S3 ROM SAR2 power/peak-detector controller. The three-bit
+                 * FSM status is idle/ready at reset; functional fast mode
+                 * completes its internal analog conversion synchronously. */
+                { 0x050u, 0x07000000u, 0xF8FFFFFFu },
+            },
+            /* The official S3 PHY library treats 0x054..0x170 as one
+             * retained private-PHY register bank. rom_read_sar_dout exposes
+             * eight read-only 13-bit conversion words within that bank. */
+            .private_register_offset = 0x054u,
+            .private_register_size = 0x120u,
+            .result_bank = {
+                .offset = 0x080u,
+                .stride = 0x004u,
+                .value_mask = 0x00001FFFu,
+                .count = 8u,
+            },
+            /* phy_hw_freq.o selects one of 256 words through the low byte of
+             * 0x0C4, transfers data through 0x0C0/0x148, and uses bits 8/9
+             * as operation/write strobes. A completed channel operation
+             * echoes index/2 in result bits 23:17; bit 31 is busy. */
+            .indexed_memory = {
+                .control_offset = 0x0C4u,
+                .read_data_offset = 0x0C0u,
+                .write_data_offset = 0x148u,
+                .status_offset = 0x168u,
+                .result_offset = 0x170u,
+                .index_mask = 0x000000FFu,
+                .write_trigger_mask = 1u << 9,
+                .operation_trigger_mask = 1u << 8,
+                .busy_mask = 1u << 31,
+                .result_index_mask = 0x7Fu << 17,
+                .word_count = 256u,
+                .index_shift = 0u,
+                .result_index_shift = 17u,
+                .index_to_result_shift = 1u,
+            },
+        },
+        .sens = {
+            .base = 0x60008800u,
+            .register_size = 0x200u,
+            .control_offset = 0x050u,
+            .control2_offset = 0x054u,
+            .clock_gate_offset = 0x104u,
+            .reset_offset = 0x108u,
+            .control_reset = 0x00019000u,
+            .control2_reset = 0x00004002u,
+            .control_writable_mask = 0x01FFF000u,
+            .control2_writable_mask = 0x00007FFFu,
+            .clock_gate_writable_mask = 0xE8000000u,
+            .reset_writable_mask = 0x6A000000u,
+            .dump_out_mask = 1u << 24,
+            .power_up_force_mask = 1u << 23,
+            .power_up_mask = 1u << 22,
+            .input_invert_mask = 1u << 13,
+            .interrupt_enable_mask = 1u << 12,
+            .ready_mask = 1u << 8,
+            .output_mask = 0xFFu,
+            .xpd_force_mask = 3u << 12,
+            .io_mux_clock_enable_mask = 1u << 31,
+            .temperature_clock_enable_mask = 1u << 29,
+            .rtc_i2c_clock_enable_mask = 1u << 27,
+            .temperature_reset_mask = 1u << 29,
+            .rtc_i2c_reset_mask = 1u << 27,
+            .coprocessor_reset_mask = 1u << 25,
+            .rtc_interrupt_mask = 1u << 12,
+            /* Raw code 104 is approximately 25 C in range 2 (offset 0). */
+            .default_output = 104u,
+            .adc_unit_count = 2u,
+            .adc_channels_per_unit = 10u,
+            .adc_power_offset = 0x03Cu,
+            .adc_status_offset = 0x040u,
+            .adc_power_writable_mask = 0xE0000000u,
+            .adc_status_writable_mask = 0x003FFFFFu,
+            .adc_clock_enable_mask = 1u << 30,
+            .adc_reset_mask = 1u << 30,
+            .adc_output_mask = 0x1FFFu, /* S3 RTC ADC is 13-bit. */
+            .adc_calibration_slave = 0x69u,
+            .adc_calibration_address = 0x07u,
+            .adc_unit = {
+                {
+                    .reader_offset = 0x000u,
+                    .measure_offset = 0x00Cu,
+                    .mux_offset = 0x010u,
+                    .atten_offset = 0x014u,
+                    .reader_reset = (1u << 29) | (1u << 18) | 2u,
+                    .reader_writable_mask =
+                        (1u << 29) | (1u << 28) |
+                        (0xFFu << 19) | (1u << 18) | 0xFFu,
+                    .reader_invert_mask = 1u << 28,
+                    .mux_writable_mask = 1u << 31,
+                    .mux_rtc_block_mask = 1u << 31,
+                    .calibration_ground_mask = 1u << 5,
+                },
+                {
+                    .reader_offset = 0x024u,
+                    .measure_offset = 0x030u,
+                    .mux_offset = 0x034u,
+                    .atten_offset = 0x038u,
+                    .reader_reset = (1u << 30) | (1u << 18) |
+                                    (1u << 16) | 2u,
+                    .reader_writable_mask =
+                        (1u << 30) | (1u << 29) |
+                        (0xFFu << 19) | (1u << 18) |
+                        (3u << 16) | 0xFFu,
+                    .reader_invert_mask = 1u << 29,
+                    .mux_writable_mask = 0xF0000000u,
+                    .calibration_ground_mask = 1u << 7,
+                    .mux_rtc_bypass_mask = 1u << 31,
+                    .arbiter_controlled = true,
+                },
+            },
+        },
+        .apb_saradc = {
+            .base = 0x60040000u,
+            .register_size = 0x1000u,
+            .control_offset = 0x000u,
+            .control2_offset = 0x004u,
+            .fsm_wait_offset = 0x00Cu,
+            .pattern_offset = { 0x018u, 0x028u },
+            .arbiter_offset = 0x038u,
+            .filter_control_offset = 0x03Cu,
+            .dma_config_offset = 0x06Cu,
+            .clock_config_offset = 0x070u,
+            .data_status_offset = { 0x040u, 0x078u },
+            .date_offset = 0x3FCu,
+            .control_reset = (1u << 30) | (15u << 19) |
+                             (15u << 15) | (4u << 7) | (1u << 6),
+            .control_writable_mask = 0xDFFFFFFBu,
+            .control2_reset = (10u << 12) | (255u << 1),
+            .control2_writable_mask = 0x01FFFFFFu,
+            .fsm_wait_reset = (255u << 16) | (8u << 8) | 8u,
+            .fsm_wait_writable_mask = 0x00FFFFFFu,
+            .pattern_writable_mask = 0x00FFFFFFu,
+            /* Reset priorities: Wi-Fi 2 > RTC 1 > APB 0. */
+            .arbiter_reset = (2u << 10) | (1u << 8),
+            .arbiter_writable_mask = 0x00001FFCu,
+            .filter_control_reset = (13u << 19) | (13u << 14),
+            .filter_control_writable_mask = 0x80FFC000u,
+            .dma_config_reset = 255u,
+            .dma_config_writable_mask = 0xC000FFFFu,
+            .clock_config_reset = 4u,
+            .clock_config_writable_mask = 0x007FFFFFu,
+            .date_reset = 0x02101180u,
+            .date_writable_mask = UINT32_MAX,
+            .pattern_length_mask = { 0xFu << 15, 0xFu << 19 },
+            .pattern_clear_mask = { 1u << 23, 1u << 24 },
+            .unit_select_mask = 1u << 5,
+            .work_mode_mask = 3u << 3,
+            .sar_clock_gate_mask = 1u << 6,
+            .sample_invert_mask = { 1u << 9, 1u << 10 },
+            .timer_select_mask = 1u << 11,
+            .timer_enable_mask = 1u << 24,
+            .dma_enable_mask = 1u << 31,
+            .dma_reset_mask = 1u << 30,
+            .dma_eof_mask = 0xFFFFu,
+            .grant_force_mask = 1u << 5,
+            .apb_force_mask = 1u << 2,
+            .rtc_force_mask = 1u << 3,
+            .force_selection_mask = 7u << 2,
+            .pattern_register_count = 4u,
+            .pattern_entries_per_register = 4u,
+            .gdma_peripheral_id = 8u,
+            .channels_per_unit = 10u,
+            .sample_data_bits = 12u,
+            .sample_channel_shift = 13u,
+            .sample_unit_shift = 17u,
+        },
+        .syscon_memory = {
+            .base = 0x60026000u,
+            .register_size = 0x1000u,
+            /* ESP32-S3 SYSCON external-memory PMS: four 64-KiB-page
+             * access-policy regions each for flash and PSRAM. */
+            .ace_region_count = 4u,
+            .ace_region_stride = 4u,
+            .flash_ace = {
+                .attribute_offset = 0x028u,
+                .address_offset = 0x038u,
+                .size_offset = 0x048u,
+                .attribute_reset = 0x000000FFu,
+                .attribute_writable_mask = 0x000001FFu,
+                .address_reset = {
+                    0x00000000u, 0x10000000u,
+                    0x20000000u, 0x30000000u,
+                },
+                .address_writable_mask = UINT32_MAX,
+                .size_reset = 0x00001000u,
+                .size_writable_mask = 0x0000FFFFu,
+            },
+            .sram_ace = {
+                .attribute_offset = 0x058u,
+                .address_offset = 0x068u,
+                .size_offset = 0x078u,
+                .attribute_reset = 0x000000FFu,
+                .attribute_writable_mask = 0x000001FFu,
+                .address_reset = {
+                    0x00000000u, 0x10000000u,
+                    0x20000000u, 0x30000000u,
+                },
+                .address_writable_mask = UINT32_MAX,
+                .size_reset = 0x00001000u,
+                .size_writable_mask = 0x0000FFFFu,
+            },
+            .front_end_power_offset = 0x09Cu,
+            .clock_force_on_offset = 0x0A8u,
+            .power_down_offset = 0x0ACu,
+            .power_up_offset = 0x0B0u,
+            /* ESP32-S3 reset keeps every front-end memory powered and all
+             * ROM/SRAM bank clocks and power explicitly forced on. */
+            .front_end_power_reset = 0x00000055u,
+            .clock_force_on_reset = 0x00003FFFu,
+            .power_down_reset = 0u,
+            .power_up_reset = 0x00003FFFu,
+            .front_end_force_power_down_mask = 0x000000AAu,
+            .front_end_force_power_up_mask = 0x00000055u,
+            .sram_bank_mask = 0x00003FF8u,
+            .rom_bank_mask = 0x00000007u,
+        },
+        .radio = {
+            .window_count = 9u,
+            .completion_count = 3u,
+            .register_count = 1u,
+            .window = {
+                { 0x60005000u, 0x1000u, 1u << 1, 2u }, /* FE2 */
+                { 0x60006000u, 0x1000u, 1u << 1, 2u }, /* FE */
+                { 0x60011000u, 0x1000u,
+                  (1u << 3) | (1u << 13), 5u },      /* BT BB */
+                { 0x6001C000u, 0x1000u, 1u << 0, 2u }, /* private NRX + NRX */
+                { 0x6001D000u, 0x1000u, 1u << 0, 2u }, /* Wi-Fi BB */
+                { 0x60031000u, 0x1000u, 1u << 11, 5u },/* private BT registers */
+                { 0x60032000u, 0x1000u,
+                  (1u << 4) | (1u << 9), 5u },       /* BT MAC */
+                { 0x60033000u, 0x2000u, 1u << 2, 2u }, /* Wi-Fi MAC */
+                { 0x60035000u, 0x1000u, 1u << 2, 2u }, /* WDEV */
+            },
+            .completion = {
+                /* ESP32-S3 rev-0 ROM rom_iq_est_enable writes enable bits
+                 * 0 then 1 at FE+0x144 and polls FE+0x174 bit 16. A quiet
+                 * virtual RF input leaves the three result accumulators at
+                 * zero while making the digital completion protocol exact. */
+                {
+                    .control_address = 0x60006144u,
+                    .active_mask = (1u << 1) | (1u << 0),
+                    .status_address = 0x60006174u,
+                    .status_mask = 1u << 16,
+                    .clock_mask = 1u << 22,
+                },
+                /* The S3 Wi-Fi HAL asserts MAC reset bit 1 and waits for
+                 * the controller's ready response in bit 0. */
+                {
+                    .control_address = 0x60033D14u,
+                    .active_mask = 1u << 1,
+                    .status_address = 0x60033D14u,
+                    .status_mask = 1u << 0,
+                    /* Espressif's S3 header names bit 6 as the Wi-Fi-only
+                     * clock even though an old generated aggregate macro
+                     * accidentally encodes that one-bit group as zero. */
+                    .clock_mask = 1u << 6,
+                },
+                /* The BLE link-layer controller starts its register-bank
+                 * initialization by setting this command bit, then waits
+                 * for hardware to consume it before programming the bank. */
+                {
+                    .control_address = 0x60031000u,
+                    .self_clear_mask = 1u << 31,
+                    .clock_mask = (1u << 16) | (1u << 17),
+                },
+            },
+            .reg = {
+                /* BLE link-layer hardware identity. Arduino-ESP32 2.0.11's
+                 * S3 controller library verifies this immutable value in
+                 * r_lld_core_init and asserts at lld.c:292 if it differs. */
+                {
+                    .address = 0x60031004u,
+                    .reset = 0x09001B00u,
+                    .writable_mask = 0u,
+                },
+            },
+            /* WDEV_RND_REG from the public ESP32-S3 register header. */
+            .random_address = 0x6003507Cu,
+            .random_clock_mask = 1u << 15,
+            .random_seed = UINT64_C(0x12345678ABCDEF01),
+            .time_latch = {
+                .count_address = 0x6003101Cu,
+                .phase_address = 0x60031020u,
+                .capture_mask = 1u << 31,
+                .count_mask = 0x0FFFFFFFu,
+                .clock_mask = 1u << 11,
+                .tick_hz = 2000000u,
+                .ticks_per_half_slot = 625u,
+            },
+            .control = {
+                .base = 0x60026000u,
+                .register_size = 0x1000u,
+                .bb_config_offset = 0x00Cu,
+                .bb_config2_offset = 0x010u,
+                .clock_offset = 0x014u,
+                .reset_offset = 0x018u,
+                .bb_config_writable_mask = UINT32_MAX,
+                .bb_config2_writable_mask = UINT32_MAX,
+                .clock_reset = 0xFFFCE030u,
+                .clock_writable_mask = UINT32_MAX,
+                .reset_writable_mask = UINT32_MAX,
+            },
+        },
+        .gdma = {
+            .base = 0x6003F000u,
+            .register_size = 0x1000u,
+            .channel_stride = 0x0C0u,
+            .descriptor_address_prefix = 0x3FC00000u,
+            .channel_count = 5u,
+            /* ESP-IDF v5.3.2 soc/esp32s3/include/soc/interrupts.h:
+             * ETS_DMA_IN_CH0..4 and ETS_DMA_OUT_CH0..4 are level sources. */
+            .rx_interrupt_source = { 66u, 67u, 68u, 69u, 70u },
+            .tx_interrupt_source = { 71u, 72u, 73u, 74u, 75u },
+        },
+        .i2s_v2 = {
+            .register_size = 0x100u,
+            /* ESP32-S3 I2S_CLK_SEL: XTAL, PLL240M, PLL160M, external. */
+            .source_clock_hz = {
+                40000000u, 240000000u, 160000000u, 0u,
+            },
+            .date_reset = 0x02009070u,
+            .instance_count = 2u,
+            .instance = {
+                {
+                    .base = 0x6000F000u,
+                    .mclk_output_signal = 23u,
+                    .tx_bck_output_signal = 22u,
+                    .tx_ws_output_signal = 24u,
+                    .rx_bck_output_signal = 26u,
+                    .rx_ws_output_signal = 27u,
+                    .data_output_signal = { 25u, 128u },
+                    .interrupt_source = 25u,
+                    .gdma_peripheral_id = 3u,
+                    .data_output_count = 2u,
+                },
+                {
+                    .base = 0x6002D000u,
+                    .mclk_output_signal = 21u,
+                    .tx_bck_output_signal = 28u,
+                    .tx_ws_output_signal = 29u,
+                    .rx_bck_output_signal = 31u,
+                    .rx_ws_output_signal = 32u,
+                    .data_output_signal = { 30u,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE },
+                    .interrupt_source = 26u,
+                    .gdma_peripheral_id = 4u,
+                    .data_output_count = 1u,
+                },
+            },
+        },
+        .lcd_cam = {
+            .base = 0x60041000u,
+            .register_size = 0x1000u,
+            .date_reset = 0x02003020u,
+            .chip_select_output_signal = 132u,
+            .data_output_signal = {
+                133u, 134u, 135u, 136u, 137u, 138u, 139u, 140u,
+                141u, 142u, 143u, 144u, 145u, 146u, 147u, 148u,
+            },
+            .h_enable_output_signal = 150u,
+            .hsync_output_signal = 151u,
+            .vsync_output_signal = 152u,
+            .dc_output_signal = 153u,
+            .pclk_output_signal = 154u,
+            .camera_data_input_signal = {
+                133u, 134u, 135u, 136u, 137u, 138u, 139u, 140u,
+                141u, 142u, 143u, 144u, 145u, 146u, 147u, 148u,
+            },
+            .camera_pclk_input_signal = 149u,
+            .camera_h_enable_input_signal = 150u,
+            .camera_hsync_input_signal = 151u,
+            .camera_vsync_input_signal = 152u,
+            .camera_xclk_output_signal = 149u,
+            .interrupt_source = 24u,
+            .gdma_peripheral_id = 5u,
+            .data_output_count = 16u,
+        },
+        .sha = {
+            .base = 0x6003B000u,
+            .register_size = 0x1000u,
+            .layout = FLEXE_SHA_LAYOUT_UNIFIED,
+            .mode_count = 8u,
+            .dma_peripheral_id = 7u,
+            .mode = {
+                FLEXE_SHA_ALGORITHM_SHA1,
+                FLEXE_SHA_ALGORITHM_SHA224,
+                FLEXE_SHA_ALGORITHM_SHA256,
+                FLEXE_SHA_ALGORITHM_SHA384,
+                FLEXE_SHA_ALGORITHM_SHA512,
+                FLEXE_SHA_ALGORITHM_SHA512_224,
+                FLEXE_SHA_ALGORITHM_SHA512_256,
+                FLEXE_SHA_ALGORITHM_SHA512_T,
+            },
+        },
+        .aes = {
+            .base = 0x6003A000u,
+            .register_size = 0x1000u,
+            .date_reset = 0x20191210u,
+            .layout = FLEXE_AES_LAYOUT_S2_S3,
+            .key_size_mask = 0x05u,
+            .dma_peripheral_id = 6u,
+            .interrupt_source = 77u,
+        },
+        .sensitive_memprot = {
+            .base = 0x600C1000u,
+            .register_size = 0x1000u,
+        },
+        .assist_debug = {
+            .base = 0x600CE000u,
+            .register_size = 0x1000u,
+            .core_stride = 0x090u,
+            .pdebug_enable_offset = 0x048u,
+            .recording_offset = 0x04Cu,
+            .pc_offset = 0x05Cu,
+            .sp_offset = 0x06Cu,
+            .pdebug_enable_mask = 0x00000001u,
+            .recording_mask = 0x00000001u,
+            .date_offset = 0x1FCu,
+            .date_reset = 0x02003040u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            .core_count = 2u,
+        },
+        .systimer = {
+            .base = 0x60023000u,
+            .register_size = 0x1000u,
+            .counter_frequency_hz = 16000000u,
+            .config_reset = 0x46000000u,
+            .date_reset = 0x02012251u,
+            .counter_count = 2u,
+            .alarm_count = 3u,
+            .counter_width = 52u,
+            .interrupt_source = { 57u, 58u, 59u },
+        },
+        .timer_group = {
+            .base = { 0x6001F000u, 0x60020000u },
+            .register_size = 0x1000u,
+            .apb_clock_hz = 80000000u,
+            .xtal_clock_hz = 40000000u,
+            .timer_config_reset = 0x60002000u,
+            .timer_config_writable_mask = 0xFFFFE600u,
+            .wdt_config_reset = {
+                0x0004C000u,
+                0x00010000u,
+                0x018CBA80u,
+                0x07FFFFFFu,
+                0x000FFFFFu,
+                0x000FFFFFu,
+            },
+            .wdt_config_writable_mask = {
+                0xFF9FF000u,
+                0xFFFF0000u,
+                UINT32_MAX,
+                UINT32_MAX,
+                UINT32_MAX,
+                UINT32_MAX,
+            },
+            .wdt_write_protect_key = 0x50D83AA1u,
+            .date_reset = 0x02003071u,
+            .date_writable_mask = 0x0FFFFFFFu,
+            .regclk_reset = 0u,
+            .regclk_writable_mask = 1u << 31,
+            .group_count = 2u,
+            .timer_count = 2u,
+            .counter_width = 54u,
+            .interrupt_source = {
+                { 50u, 51u, 52u },
+                { 53u, 54u, 55u },
+            },
+        },
+        .rmt_v1 = {
+            .base = 0x60016000u,
+            .register_size = 0x1000u,
+            .memory_offset = 0x800u,
+            .tx_channel_count = 4u,
+            .channel_count = 8u,
+            .words_per_channel = 48u,
+            .interrupt_source = 40u,
+            /* Espressif esp32s3 gpio_sig_map.h: RMT_SIG_IN0_IDX. */
+            .input_signal_base = 81u,
+            .output_signal_base = 81u,
+            .apb_clock_hz = 80000000u,
+            .ref_clock_hz = 8000000u,
+            .xtal_clock_hz = 40000000u,
+        },
+        .ledc_v1 = {
+            .base = 0x60019000u,
+            .register_size = 0x1000u,
+            .source_clock_hz = { 0u, 80000000u, 8000000u,
+                                 40000000u },
+            .date_reset = 0x19040200u,
+            .output_signal_base = 73u,
+            .interrupt_source = 35u,
+        },
+        .gp_spi = {
+            .register_size = 0x100u,
+            .date_reset = 0x02101190u,
+            .host_count = 2u,
+            .layout = FLEXE_GP_SPI_LAYOUT_S2_S3,
+            .instance = {
+                {
+                    .base = 0x60024000u,
+                    .clock_out_signal = 101u,
+                    .data_out_signal = {
+                        102u, 103u, 104u, 105u,
+                        106u, 107u, 108u, 109u,
+                    },
+                    .chip_select_out_signal = {
+                        110u, 111u, 112u, 113u, 114u, 115u,
+                    },
+                    .interrupt_source = 21u,
+                    .data_out_signal_count = 8u,
+                    .chip_select_count = 6u,
+                    .iomux_clock_pin = 12u,
+                    .iomux_chip_select0_pin = 10u,
+                    .iomux_function = 4u,
+                    .gdma_peripheral_id = 0u,
+                },
+                {
+                    .base = 0x60025000u,
+                    .clock_out_signal = 66u,
+                    .data_out_signal = { 67u, 68u, 69u, 70u },
+                    .chip_select_out_signal = {
+                        71u, 72u, 127u,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                        FLEXE_TARGET_MATRIX_SIGNAL_NONE,
+                    },
+                    .interrupt_source = 22u,
+                    .data_out_signal_count = 4u,
+                    .chip_select_count = 3u,
+                    .iomux_clock_pin = FLEXE_TARGET_GPIO_NONE,
+                    .iomux_chip_select0_pin = FLEXE_TARGET_GPIO_NONE,
+                    .iomux_function = FLEXE_TARGET_GPIO_NONE,
+                    .gdma_peripheral_id = 1u,
+                },
+            },
+        },
+        .spi_mem = {
+            .base = { 0x60003000u, 0x60002000u },
+            .register_size = 0x1000u,
+            .default_jedec_id = 0x001640C8u,
+            .maximum_flash_size = 0x08000000u,
+            .date_reset = 0x02101040u,
+            .host_count = 2u,
+            .flash_chip_select = 0u,
+            .psram_chip_select = FLEXE_SPI_MEM_CS_NONE,
+            .layout = FLEXE_SPI_MEM_LAYOUT_S2_S3,
+            .psram_kind = FLEXE_SPI_MEM_PSRAM_NONE,
+        },
+        .rom_flash = {
+            .pointer_symbol = "rom_spiflash_legacy_data",
+            .struct_size = 24u,
+            .device_id_offset = 0u,
+            .chip_size_offset = 4u,
+            .block_size_offset = 8u,
+            .sector_size_offset = 12u,
+            .page_size_offset = 16u,
+            .status_mask_offset = 20u,
+            .block_size = 0x00010000u,
+            .sector_size = 0x00001000u,
+            .page_size = 0x00000100u,
+            .status_mask = 0x0000FFFFu,
+        },
+        .usb_serial_jtag = {
+            .base = 0x60038000u,
+            .register_size = 0x1000u,
+            .interrupt_source = 96u,
+            .interrupt_valid_mask = 0x00000FFFu,
+            .interrupt_raw_reset = 1u << 3,
+            .conf0_reset = (1u << 14) | (1u << 9),
+            .conf0_writable_mask = 0x0001FFFFu,
+            .test_writable_mask = 0x0000000Fu,
+            .misc_conf_writable_mask = 1u,
+            .mem_conf_reset = 1u << 1,
+            .mem_conf_writable_mask = 3u,
+            .date_reset = 0x02101200u,
+            .date_writable_mask = UINT32_MAX,
+            .endpoint_size = 64u,
+        },
+        .backing_size = {
+            [FLEXE_MEM_SRAM] = 0x00080000u,
+            [FLEXE_MEM_ROM] = 0x00060000u,
+            [FLEXE_MEM_FLASH_DATA] = 0x00400000u,
+            [FLEXE_MEM_FLASH_INSN] = 0x00400000u,
+            [FLEXE_MEM_RTC_FAST] = 0x00002000u,
+            [FLEXE_MEM_RTC_SLOW] = 0x00002000u,
+        },
+        .memory_region_count = 9,
+        .memory_region = {
+            { 0x3C000000u, 0x3C400000u, FLEXE_MEM_FLASH_DATA, 0, "flash_data" },
+            { 0x3FC88000u, 0x3FD00000u, FLEXE_MEM_SRAM, 0, "sram_data" },
+            /* The S3 mask ROM exposes its final 128 KiB through the D-bus.
+             * Espressif's ROM ELF gives .rodata a VMA in this window and an
+             * LMA in the matching 0x4004_0000 instruction-ROM aperture. */
+            { 0x3FF00000u, 0x3FF20000u, FLEXE_MEM_ROM, 0x00040000u, "rom_data" },
+            { 0x40000000u, 0x40060000u, FLEXE_MEM_ROM, 0, "rom" },
+            /* 0x40370000..0x40377fff is cache SRAM. The remaining IRAM
+             * aliases 0x3fc88000..0x3fceffff byte-for-byte. */
+            { 0x40370000u, 0x40378000u, FLEXE_MEM_SRAM, 0x00078000u, "sram_insn" },
+            { 0x40378000u, 0x403E0000u, FLEXE_MEM_SRAM, 0, "sram_insn" },
+            { 0x42000000u, 0x42400000u, FLEXE_MEM_FLASH_INSN, 0, "flash_insn" },
+            { 0x50000000u, 0x50002000u, FLEXE_MEM_RTC_SLOW, 0, "rtc_slow" },
+            { 0x600FE000u, 0x60100000u, FLEXE_MEM_RTC_FAST, 0, "rtc_fast" },
+        },
+        .peripheral_start = 0x60000000u,
+        .peripheral_end = 0x600D1000u,
+        .executable_range_count = 5,
+        .executable = {
+            { 0x40000000u, 0x40060000u }, /* mask ROM */
+            { 0x40370000u, 0x403E0000u }, /* internal IRAM */
+            { 0x42000000u, 0x44000000u }, /* flash/PSRAM MMU window */
+            { 0x50000000u, 0x50002000u }, /* RTC slow/reset vector 0 */
+            { 0x600FE000u, 0x60100000u }, /* RTC fast memory */
+        },
+        .extension_count = 1u,
+        .extension = {
+            { FLEXE_TARGET_EXTENSION_TOUCH_V2, &ESP32S3_TOUCH_V2 },
+        },
+    },
+};
+
+const flexe_target_desc_t *flexe_target_by_id(flexe_target_id_t id)
+{
+    for (unsigned i = 0; i < sizeof(TARGETS) / sizeof(TARGETS[0]); i++)
+        if (TARGETS[i].id == id) return &TARGETS[i];
+    return NULL;
+}
+
+const flexe_target_desc_t *flexe_target_by_image_chip_id(uint16_t chip_id)
+{
+    for (unsigned i = 0; i < sizeof(TARGETS) / sizeof(TARGETS[0]); i++)
+        if (TARGETS[i].image_chip_id == chip_id) return &TARGETS[i];
+    return NULL;
+}
+
+const flexe_target_desc_t *flexe_target_by_name(const char *name)
+{
+    if (!name) return NULL;
+    for (unsigned i = 0; i < sizeof(TARGETS) / sizeof(TARGETS[0]); i++)
+        if (strcmp(TARGETS[i].name, name) == 0) return &TARGETS[i];
+    if (strcmp(name, "esp32-s3") == 0)
+        return flexe_target_by_id(FLEXE_TARGET_ESP32S3);
+    return NULL;
+}
+
+const void *flexe_target_extension(const flexe_target_desc_t *target,
+                                   uint32_t tag)
+{
+    if (!target || tag == 0u ||
+        target->extension_count > FLEXE_TARGET_EXTENSION_MAX)
+        return NULL;
+    for (unsigned i = 0u; i < target->extension_count; i++)
+        if (target->extension[i].tag == tag)
+            return target->extension[i].descriptor;
+    return NULL;
+}
+
+bool flexe_target_with_board_psram(const flexe_target_desc_t *base,
+                                   flexe_board_psram_t board_psram,
+                                   flexe_target_desc_t *out)
+{
+    if (!base || !out) return false;
+    if (board_psram == FLEXE_BOARD_PSRAM_DEFAULT) {
+        *out = *base;
+        return true;
+    }
+    if (board_psram != FLEXE_BOARD_PSRAM_AP_8M_OPI ||
+        base->id != FLEXE_TARGET_ESP32S3 ||
+        base->spi_mem.psram_kind != FLEXE_SPI_MEM_PSRAM_NONE ||
+        base->spi_mem.psram_chip_select != FLEXE_SPI_MEM_CS_NONE ||
+        base->backing_size[FLEXE_MEM_PSRAM] != 0u)
+        return false;
+    *out = *base;
+    out->backing_size[FLEXE_MEM_PSRAM] = 0x00800000u;
+    out->spi_mem.psram_chip_select = 1u;
+    out->spi_mem.psram_kind = FLEXE_SPI_MEM_PSRAM_AP_8M_OPI;
+    return true;
+}
+
+int flexe_target_parse(const char *name, flexe_target_id_t *id_out)
+{
+    if (!name || !id_out) return -1;
+    if (strcmp(name, "auto") == 0) {
+        *id_out = FLEXE_TARGET_AUTO;
+        return 0;
+    }
+    const flexe_target_desc_t *target = flexe_target_by_name(name);
+    if (!target) return -1;
+    *id_out = target->id;
+    return 0;
+}
+
+bool flexe_target_pc_is_executable(const flexe_target_desc_t *target,
+                                   uint32_t pc)
+{
+    if (!target ||
+        target->executable_range_count > FLEXE_TARGET_EXEC_RANGE_MAX)
+        return false;
+    for (unsigned i = 0; i < target->executable_range_count; i++) {
+        const flexe_addr_range_t *range = &target->executable[i];
+        if (range->end > range->start &&
+            (uint32_t)(pc - range->start) < range->end - range->start)
+            return true;
+    }
+    return false;
+}
+
+bool flexe_target_range_uses_backing(const flexe_target_desc_t *target,
+                                     uint32_t addr, uint32_t size,
+                                     flexe_mem_backing_t backing)
+{
+    uint64_t end = (uint64_t)addr + size;
+    if (!target || backing >= FLEXE_MEM_BACKING_COUNT ||
+        target->memory_region_count > FLEXE_TARGET_MEM_REGION_MAX ||
+        end > (UINT64_C(1) << 32))
+        return false;
+    for (unsigned i = 0; i < target->memory_region_count; i++) {
+        const flexe_target_mem_region_t *region = &target->memory_region[i];
+        if (region->backing == backing && addr >= region->start &&
+            end <= region->end)
+            return true;
+    }
+    return false;
+}
+
+uint32_t flexe_target_bootstrap_stack(const flexe_target_desc_t *target,
+                                      unsigned core)
+{
+    if (!target || core >= target->core_count || core >= 2u) return 0;
+    return target->bootstrap_stack_top[core];
+}

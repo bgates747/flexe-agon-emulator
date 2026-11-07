@@ -1,0 +1,209 @@
+--- a/src/jit.c
++++ b/src/jit.c
+@@ -37,6 +37,8 @@
+ #if defined(JIT_NEEDS_WX)
+     pthread_jit_write_protect_np(1);
+     sys_icache_invalidate(start, len);
++#elif defined(__aarch64__)
++    __builtin___clear_cache((char *)start, (char *)start + len);
+ #else
+     (void)start; (void)len;
+ #endif
+@@ -501,7 +503,7 @@
+                 }
+                 if (r == 1) return 0;  /* MOVSP — guarded architectural move */
+                 if (r == 2)
+-                    return xtensa_sync_encoding_valid(insn) ? 0 : 2;
++                    return xtensa_sync_encoding_valid(insn) && XT_T(insn) != 0u ? 0 : 2;
+                 if (r == 3) {
+                     /* The architectural window spill/fill vectors end in
+                      * RFWO/RFWU. They are self-contained block terminators;
+@@ -3584,6 +3586,8 @@
+     memcpy(jmp_site, &insn, 4);
+ #  if defined(JIT_NEEDS_WX)
+     sys_icache_invalidate(jmp_site, 4);
++#  else
++    __builtin___clear_cache((char *)jmp_site, (char *)jmp_site + 4);
+ #  endif
+ #else
+     int32_t rel = (int32_t)(target - (jmp_site + 5));
+--- a/src/xtensa.h
++++ b/src/xtensa.h
+@@ -558,6 +558,10 @@
+     xtensa_code_invalidate_fn code_invalidate;
+     void *code_invalidate_ctx;
+ 
++    /* Optional ISYNC observer: host translation coherence for changed RAM. */
++    void (*instruction_sync)(xtensa_cpu_t *cpu, void *ctx);
++    void *instruction_sync_ctx;
++
+     /* Cold companion to pc_hook_bitmap. Kept at the end so adding an exact
+      * translation-time query does not disturb the interpreter's hot layout.
+      * It has its own context because pc_hook/pc_hook_ctx may be wrapped by a
+--- a/src/xtensa.c
++++ b/src/xtensa.c
+@@ -911,7 +911,7 @@
+                 else if (op2 >= 1 && op2 <= 3) kind = PD_LOGIC;
+                 else if (op2 != 0) kind = PD_ALU;
+                 else if (r == 6) kind = PD_RSIL;
+-                else if (r == 2 && xtensa_sync_encoding_valid(insn)) kind = PD_NOP;
++                else if (r == 2 && xtensa_sync_encoding_valid(insn)) kind = XT_T(insn) == 0u ? PD_SLOW : PD_NOP;
+                 else if (r >= 8 && r <= 11) kind = PD_ALU;
+                 else if (r == 0 && XT_M(insn) == 2 && XT_N(insn) == 0) kind = PD_RET;
+                 else if (r == 0 && XT_M(insn) == 2 && XT_N(insn) == 1) kind = PD_RETW;
+@@ -2186,10 +2186,10 @@
+                                            cpu->pc - 3u, 0);
+                     return false;
+                 }
+-                /* Fast mode has a single strongly ordered host timeline, so
+-                 * ISYNC/RSYNC/ESYNC/DSYNC/EXTW/MEMW/EXCW need no additional
+-                 * operation here. Accurate schedulers will use these as
+-                 * synchronization boundaries. */
++                /* ISYNC is a translation-coherence boundary for code written
++                 * to executable RAM. Other barriers retain ordered-host semantics. */
++                if (XT_T(insn) == 0u && cpu->instruction_sync)
++                    cpu->instruction_sync(cpu, cpu->instruction_sync_ctx);
+                 break;
+             case 3: /* RFEI group */
+                 switch (t) {
+@@ -3646,7 +3646,11 @@
+                 cpu->ps = (cpu->ps & ~0xFu) | s;
+                 return true;
+             }
+-            if (r == 2 && xtensa_sync_encoding_valid(insn)) return true;
++            if (r == 2 && xtensa_sync_encoding_valid(insn)) {
++                if (XT_T(insn) == 0u && cpu->instruction_sync)
++                    cpu->instruction_sync(cpu, cpu->instruction_sync_ctx);
++                return true;
++            }
+             if (r >= 8 && r <= 11) {
+                 exec_qrst(cpu, insn); return true;
+             }
+--- a/src/flexe_session.c
++++ b/src/flexe_session.c
+@@ -967,6 +967,8 @@
+     cpu->aot_bitmap = old.aot_bitmap;
+     cpu->code_invalidate = old.code_invalidate;
+     cpu->code_invalidate_ctx = old.code_invalidate_ctx;
++    cpu->instruction_sync = old.instruction_sync;
++    cpu->instruction_sync_ctx = old.instruction_sync_ctx;
+     cpu->accelerated_blocks = old.accelerated_blocks;
+     cpu->record_branch_targets = old.record_branch_targets;
+     cpu->window_trace = old.window_trace;
+--- a/src/peripherals.c
++++ b/src/peripherals.c
+@@ -1407,6 +1407,8 @@
+     uint16_t rx_head;
+     uint16_t rx_tail;
+     uint16_t rx_count;
++    esp32_periph_t *owner;
++    int number;
+     uart_tx_cb cb;
+     void    *cb_ctx;
+     uint32_t shadow[64];
+@@ -2790,6 +2792,43 @@
+     (void)mask;
+ }
+ 
++/* Classic ESP32 timeout runs on the baud clock after incoming data stops.
++ * Immediate host-injection-only timeout loses tail bytes when an ISR clears
++ * TOUT while more bytes remain in the FIFO. Use the existing event clock so
++ * interpreter, JIT and WAITI all see the same hardware-level condition. */
++static void uart_rx_timeout_fire(void *ctx) {
++    uart_state_t *uart = ctx;
++    esp32_periph_t *p = uart->owner;
++    const flexe_uart_ip_desc_t *ip = &p->target->uart_ip;
++    if (uart->clock_enabled && !uart->reset_asserted && uart->rx_count &&
++        (uart->shadow[0x24 / 4] & ip->rx_timeout_enable_mask)) {
++        uart->int_raw |= UART_RXFIFO_TOUT_INT;
++        uart_intr_update(p, uart->number);
++    }
++}
++
++static void uart_arm_rx_timeout(esp32_periph_t *p, int uart_num) {
++    if (!(p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS))
++        return;
++    uart_state_t *uart = &p->uart[uart_num];
++    periph_cancel_deferred(p, uart_rx_timeout_fire, uart);
++    uint32_t conf1 = uart->shadow[0x24 / 4];
++    if (!uart->clock_enabled || uart->reset_asserted || !uart->rx_count ||
++        !(conf1 & p->target->uart_ip.rx_timeout_enable_mask)) return;
++    uint64_t threshold = (conf1 >> 24) & 127u;
++    uint32_t clkdiv = uart->shadow[0x14 / 4];
++    uint64_t divider16 = ((uint64_t)(clkdiv & 0xfffffu) << 4) |
++                         ((clkdiv >> 20) & 15u);
++    /* ESP-IDF 4.4 uart_ll_set_rx_tout: APB threshold counts baud/8;
++     * REF_TICK threshold uses an eightfold hardware workaround. */
++    bool apb = (uart->shadow[0x20 / 4] & (1u << 27)) != 0u;
++    uint64_t numerator = divider16 * threshold * (apb ? 8u : 1u);
++    uint64_t denominator = apb ? (16u * 80u) : (16u * 8u);
++    uint64_t delay_us = (numerator + denominator - 1u) / denominator;
++    if (!delay_us) delay_us = 1u;
++    (void)periph_schedule_deferred_us(p, delay_us, uart_rx_timeout_fire, uart);
++}
++
+ static void uart_refresh_level_conditions(esp32_periph_t *p, int uart_num) {
+     const flexe_uart_ip_desc_t *ip = p ? &p->target->uart_ip : NULL;
+     if (!uart_num_valid(p, uart_num)) return;
+@@ -2838,6 +2877,7 @@
+     uart->rx_head = 0u;
+     uart->rx_tail = 0u;
+     uart->rx_count = 0u;
++    periph_cancel_deferred(p, uart_rx_timeout_fire, uart);
+     memset(uart->shadow, 0, sizeof(uart->shadow));
+     uart->shadow[ip->date_offset / 4u] = ip->date_reset;
+     uart->int_raw = ip->interrupt_raw_reset;
+@@ -2885,6 +2925,8 @@
+         uint8_t byte = uart->rx[uart->rx_tail];
+         uart->rx_tail = (uint16_t)((uart->rx_tail + 1) % UART_RX_FIFO_SIZE);
+         uart->rx_count--;
++        if (!uart->rx_count)
++            periph_cancel_deferred(p, uart_rx_timeout_fire, uart);
+         return byte;
+     }
+     case 0x04: return uart->int_raw;                    /* INT_RAW */
+@@ -2924,6 +2966,7 @@
+         uart_intr_update(p, uart_num);
+     } else if (off == 0x10) {       /* INT_CLR (W1TC) */
+         uart->int_raw &= ~(val & ip->interrupt_valid_mask);
++        if (val & UART_RXFIFO_TOUT_INT) uart_arm_rx_timeout(p, uart_num);
+         /* FIFO threshold and TX empty are level-triggered. */
+         uart_refresh_level_conditions(p, uart_num);
+         uart_intr_update(p, uart_num);
+@@ -2931,8 +2974,9 @@
+         if (off / 4 < 64) uart->shadow[off / 4] = val;
+         if (off == 0x24) {          /* CONF1 threshold/timeout controls */
+             uart_refresh_level_conditions(p, uart_num);
+-            if (uart->rx_count > 0 &&
+-                (val & ip->rx_timeout_enable_mask))
++            if (p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)
++                uart_arm_rx_timeout(p, uart_num);
++            else if (uart->rx_count > 0 && (val & ip->rx_timeout_enable_mask))
+                 uart->int_raw |= UART_RXFIFO_TOUT_INT;
+             uart_intr_update(p, uart_num);
+         }
+@@ -2958,6 +3002,8 @@
+                                     uart_read, uart_write, p) != 0)
+             return -1;
+         tx_signal_seen[desc->tx_output_signal] = true;
++        p->uart[uart_num].owner = p;
++        p->uart[uart_num].number = uart_num;
+         p->uart[uart_num].clock_enabled = true;
+         uart_reset_state(p, (unsigned)uart_num);
+     }
+@@ -16649,9 +16695,12 @@
+      * bursts also assert the FIFO threshold. */
+     uint32_t conf1 = uart->shadow[0x24 / 4];
+     uart_refresh_level_conditions(p, uart_num);
+-    if (accepted > dma_accepted &&
+-        (conf1 & ip->rx_timeout_enable_mask))
+-        uart->int_raw |= UART_RXFIFO_TOUT_INT;
++    if (accepted > dma_accepted) {
++        if (p->target->capabilities & FLEXE_TARGET_CAP_ESP32_CLASSIC_PERIPHERALS)
++            uart_arm_rx_timeout(p, uart_num);
++        else if (conf1 & ip->rx_timeout_enable_mask)
++            uart->int_raw |= UART_RXFIFO_TOUT_INT;
++    }
+     if (accepted < len)
+         uart->int_raw |= UART_RXFIFO_OVF_INT;
+     uart_intr_update(p, uart_num);

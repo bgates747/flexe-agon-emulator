@@ -1,0 +1,21 @@
+{
+  "product": "Flexe Agon Emulator",
+  "version": "0.1.0",
+  "candidate": "0.1.0-rc1",
+  "status": "source-review-candidate",
+  "distribution": "source-only; no firmware, SD/application assets or binaries",
+  "frontend_base": {
+    "repository": "https://github.com/tomm/fab-agon-emulator",
+    "revision": "c22876d1f7ad903537c308cf65afd6553b37cdb8",
+    "tag": "1.2.5"
+  },
+  "assessed_newer_fab": {
+    "revision": "9195e0f63053ec53e952dfa5af6c185e13508fb7",
+    "tag": "1.2.6",
+    "fully_integrated": false
+  },
+  "flexe_revision": "fbda8e905ccff36a090e4e33b0ffc2337dd79c52",
+  "ez80_revision": "13c151e89f520b3bae3343bea9d67d06e8037cfa",
+  "initial_binary_target": "x86_64-unknown-linux-gnu",
+  "runtime_acceptance": "pending"
+}

@@ -1,0 +1,493 @@
+{
+  "repository": "https://github.com/levkropp/flexe",
+  "revision": "fbda8e905ccff36a090e4e33b0ffc2337dd79c52",
+  "original_cmake_sha256": "0245187f8605c01f6545f9d14f78d7cc5ba0bb9a4b70c09668bddf83cbd12853",
+  "production_cmake_sha256": "32ad3b7a8177159fde5eeca6495e038130e4103d0cd017f11949e0cec074e560",
+  "cmake_change": "Retain upstream library target/options; omit standalone executables and developer test/fixture targets",
+  "files": [
+    {
+      "path": "src/aes_stubs.c",
+      "sha256": "4fc41a22332a99c7e885029c285bc65b181d330cc7d08523db793369b8c0f6f2"
+    },
+    {
+      "path": "src/aes_stubs.h",
+      "sha256": "0142d57ff9be729690b0bf90d053acaf92126af6dc19ba37098ede0b5858ac6c"
+    },
+    {
+      "path": "src/aot.c",
+      "sha256": "95df8cbb390394c39c5b62c6ba10f74256471dae0792442a20159b467dc5efc0"
+    },
+    {
+      "path": "src/aot.h",
+      "sha256": "1f7fd7cf94cf7ce440edcb1c07ed725144f62725c53a2443d064f26fa152e304"
+    },
+    {
+      "path": "src/apb_saradc.c",
+      "sha256": "e2f69684bd3f2d93bf57e6e5c6c790066d35d59225fb4fe594b411b305f3eda8"
+    },
+    {
+      "path": "src/apb_saradc.h",
+      "sha256": "0e8a931f121822d63e6c1742afd2c066a920cbb3a594369b531ec6a156edf130"
+    },
+    {
+      "path": "src/assist_debug.c",
+      "sha256": "64a2f7b76d2898283fad1d647842c07b1b3a0aa79001f14df8823aa550717523"
+    },
+    {
+      "path": "src/assist_debug.h",
+      "sha256": "872d39b37f0d889daa8dc6307a5456d4ba9f7ed0d0002897e9eb4a79c81ed6d5"
+    },
+    {
+      "path": "src/axp192.c",
+      "sha256": "c517ed758b7584c8e55a6ad1384b23088a9fd4953e74c8c128882465bdf120cb"
+    },
+    {
+      "path": "src/axp192.h",
+      "sha256": "555af2e701595e09c2515297c1a1a1bf83279c7ad35be07a9226c15f514371b5"
+    },
+    {
+      "path": "src/bt_stubs.c",
+      "sha256": "6fe99ee4aac117d32fcffcfa84a66cb928ec8f77cc647bacc0f578c018e30c73"
+    },
+    {
+      "path": "src/bt_stubs.h",
+      "sha256": "157af2731bc8da75dc1ced54d8db7d7555783f5cde185a99892626526742f55a"
+    },
+    {
+      "path": "src/display_stubs.c",
+      "sha256": "5e4a5f73e84d17cc5fe4b99e7302f636bd615ae4c40be81bb0bb623f460574dc"
+    },
+    {
+      "path": "src/display_stubs.h",
+      "sha256": "6cef8485a198ede5170616672d58e0faf071bcad9c92b74d9d93887b898b31f5"
+    },
+    {
+      "path": "src/efuse.c",
+      "sha256": "1cc384378c52ea76dc446b4295987dc7c378859320dfc7d40652cbd2dfb6ef89"
+    },
+    {
+      "path": "src/efuse.h",
+      "sha256": "8b098a7de7c889ac16dd10a531e04a02f3a97685e613c30e6f1e5971eac640c2"
+    },
+    {
+      "path": "src/elf_symbols.c",
+      "sha256": "a307788918f54966fabde8c4d68ec1bc6c0b84396b745612d749620b2b7f2081"
+    },
+    {
+      "path": "src/elf_symbols.h",
+      "sha256": "b65c6a8ae1b14fe5c1d52448f280f1bed32d45cbd53fd8875d5514cb2e65e47a"
+    },
+    {
+      "path": "src/esp32s3_extmem.c",
+      "sha256": "bfc3ce1009a13537cd3c18ecfb885738f42ccf7bc03e5572496c76a4eecd1b88"
+    },
+    {
+      "path": "src/esp32s3_extmem.h",
+      "sha256": "6a03e75dfef007e1972746c8404c2100bb221d6ca11b88b5fdde6db98b9b148a"
+    },
+    {
+      "path": "src/esp_timer_stubs.c",
+      "sha256": "386c2478651ab5d6071fcb668b1b90404484bd88e2d76b60cfd9672cd174c365"
+    },
+    {
+      "path": "src/esp_timer_stubs.h",
+      "sha256": "924b291df25a71bf7d12f032d47fb2026ce029e51f8800223405ceaf3ad7aeb2"
+    },
+    {
+      "path": "src/firmware_scan.c",
+      "sha256": "fe7626741cad2cf2a45d86f33554d8a9805a2854579364e734a16ec9ca1a4bb9"
+    },
+    {
+      "path": "src/firmware_scan.h",
+      "sha256": "0aace32751cd74cf35be23529fad539f66a9fa8be92141afcfeb2ad9685b3bb1"
+    },
+    {
+      "path": "src/flash_mmu.c",
+      "sha256": "20cbd70b576f64c4a4c81d80d07280483144a1f2f5b70950e17f3b5aaf145d6c"
+    },
+    {
+      "path": "src/flash_mmu.h",
+      "sha256": "a9ab701c2628f91f8bfb664b26f9f6baa8ee5ed58a95f1a44c0f59a568685c6f"
+    },
+    {
+      "path": "src/flexe_session.c",
+      "sha256": "5c0d0283247ed2a023bdddadb1086572d04142378a0bada6f5971efd45fea5a0"
+    },
+    {
+      "path": "src/flexe_session.h",
+      "sha256": "d4fc19213c07cde822f53551070b36b760072093a67326fb05cb6279fa50dc2b"
+    },
+    {
+      "path": "src/freertos_stubs.c",
+      "sha256": "0294aebd7cba899e526ae18e81549affdca9aa6d89f2b7a446e8ce4d7174d2f9"
+    },
+    {
+      "path": "src/freertos_stubs.h",
+      "sha256": "e2bd93fb0a7ce0ba99989964ab9b657efb668f113aec4df7ed071e3d9afe0aa9"
+    },
+    {
+      "path": "src/gdma.c",
+      "sha256": "fcf120b2b75f95206638c54f06fb82dd99b4b257414c2596a08fe9d5d09463d2"
+    },
+    {
+      "path": "src/gdma.h",
+      "sha256": "54b0db80ff53e7dadc97a656e9bbd93ab85f5d2bb75b1f47d25cf672d2a73396"
+    },
+    {
+      "path": "src/gpio.c",
+      "sha256": "10c25da0f564c5e7b1d18a3f8cf910b01eb95888ddad01343c01fdc0c7fd4a06"
+    },
+    {
+      "path": "src/gpio.h",
+      "sha256": "4b84e95a7ef9c04b563b31dec4c21cd222b2d4663c67025cbe603a435c8f672a"
+    },
+    {
+      "path": "src/guest_call.c",
+      "sha256": "62bc98e2d0d30e133ba5e2180bea79b6391cb84bbe4fd53b51adb443e2b440bf"
+    },
+    {
+      "path": "src/guest_call.h",
+      "sha256": "b2933ed75023d4065b2b51cb7c1ae5f09e1e08f1ec24fdf278e4aa3e54ba6cd9"
+    },
+    {
+      "path": "src/hierarchical_trace.c",
+      "sha256": "684906098a432086c68186fd3dd3260a05f82059b294727a96aa84637f465c23"
+    },
+    {
+      "path": "src/hierarchical_trace.h",
+      "sha256": "7ddcf72e0e03c6bf145b02d38449d0c67baed845038c2cc7494da60b21917e8f"
+    },
+    {
+      "path": "src/i2s_v2.c",
+      "sha256": "9edc78088c108d47b8a7bddd80be363136966f78e486b2a4574628c62cf98eb0"
+    },
+    {
+      "path": "src/i2s_v2.h",
+      "sha256": "4a603becb92756410f45491f89eadfc2a1fdf55f575f26c38e8a4d449e786901"
+    },
+    {
+      "path": "src/io_mux.c",
+      "sha256": "b1da0b1607c59fdfd9d458bf7a84123e5e0dc3553167ce873b3fbf00c472bf55"
+    },
+    {
+      "path": "src/io_mux.h",
+      "sha256": "8073deb6f6f22e951e61f7953dbacb1198955d7194d0055fa9f6cb4b1276b352"
+    },
+    {
+      "path": "src/jit.c",
+      "sha256": "1f609d01e16e3300e6f97d71e31bc74cee8353fc9c5631e828e725f5606ca437"
+    },
+    {
+      "path": "src/jit.h",
+      "sha256": "a5a49c065b59c372e853c0d4edee9d355968d615e9cacae1e75c7c0d9fdad4e7"
+    },
+    {
+      "path": "src/jit_emit_arm64.h",
+      "sha256": "55b7a323e1002b707428b47ece57a31d38b6e217b7db5f815676be2f76fe33e7"
+    },
+    {
+      "path": "src/jit_emit_x64.h",
+      "sha256": "4ff55b171e49132486260a66686619cfb0f8f6de7e6dca10eea868451ee43122"
+    },
+    {
+      "path": "src/jit_stub.c",
+      "sha256": "069dc56cbfe59065dda5f5a419487d976dd217e760012a21fb828934081637a7"
+    },
+    {
+      "path": "src/lcd_cam.c",
+      "sha256": "7a9cec055a5478d406cd4d331f93e7fb4f2921b09d994f469faafe0bfabdc702"
+    },
+    {
+      "path": "src/lcd_cam.h",
+      "sha256": "ebc5bc517c823f408e3e1a9d3c369c0fe54a199b7170b370711348d7353d9429"
+    },
+    {
+      "path": "src/loader.c",
+      "sha256": "a4e142899b0500e1a332cd7d7de5c770bc559169ccb8223863b70b72cef8b738"
+    },
+    {
+      "path": "src/loader.h",
+      "sha256": "be6897b4048c763116e16ede5acd60e1ca44b1e3d016149353fdb4beaecb9ba0"
+    },
+    {
+      "path": "src/memory.c",
+      "sha256": "6cb34f743ef9e68c313a69899a8a332539b609ca0d1beca452d18947dfc53195"
+    },
+    {
+      "path": "src/memory.h",
+      "sha256": "05dfd6fb9f00e2768deb495e1021f81b508e9fabef88b580afc55a52e4e85f99"
+    },
+    {
+      "path": "src/mpi_stubs.c",
+      "sha256": "d090caec7fe6900b08a4f4633c65e919b866b6a4286c32be4acaa2f728640783"
+    },
+    {
+      "path": "src/mpi_stubs.h",
+      "sha256": "8e8e18443b6df6a8a1544a7340355edecdb4eea1b75909b5e5df3ac1d0dd32ed"
+    },
+    {
+      "path": "src/msvc_compat.c",
+      "sha256": "0468eca2f4535d8384a1d27ff6776a898efb5a89ac14c97428ff1a569de49a42"
+    },
+    {
+      "path": "src/msvc_compat.h",
+      "sha256": "2604b48580b76e57749ef1c23e424108ab30f8ae843db129e510776b5c7c2d7c"
+    },
+    {
+      "path": "src/peripherals.c",
+      "sha256": "8d818236131b9191d600916a0eda00ee449a9a193fa8a460a3206aed2cd370c0"
+    },
+    {
+      "path": "src/peripherals.h",
+      "sha256": "c7a672deb761b7881aefe69a5a0ae0669e6b2da0c0b6d0ae1ac78fa0e940e9b0"
+    },
+    {
+      "path": "src/profile.c",
+      "sha256": "21de41bc5305624532d950d92e9809818f4d5886e6298fd5c740a93d850392c8"
+    },
+    {
+      "path": "src/radio.c",
+      "sha256": "900208254c9f218d729ca26f5a265e5f7411b9fa083a12e06dfad8278797c184"
+    },
+    {
+      "path": "src/radio.h",
+      "sha256": "503db501e6804ccce3cce9314589eb237a3af4bd775e469d0ae211c38f6b6067"
+    },
+    {
+      "path": "src/regi2c.c",
+      "sha256": "279f095f2e942b12d9181b2f9e713f245bbde20dad1bd7780178654c8a6bfaaf"
+    },
+    {
+      "path": "src/regi2c.h",
+      "sha256": "4be4e730fd4d3017c698b7734bfd95f099394bdc0b4c6741057fde19183b34e1"
+    },
+    {
+      "path": "src/rmt_v1.c",
+      "sha256": "e75eab83f1015255732919695c2e807b0d9a55f46d85dcf731c5640ec91961f5"
+    },
+    {
+      "path": "src/rmt_v1.h",
+      "sha256": "21dab5f0dc1cf2e9c462c1b608c610bc6c672efc8ade89266eaf540f32f23f29"
+    },
+    {
+      "path": "src/rom_elf.c",
+      "sha256": "b90c7aceceaaad35b5719ac3aec2dc3b6167c7cec45f09e779415b3340aec853"
+    },
+    {
+      "path": "src/rom_elf.h",
+      "sha256": "d13915f3ae1674e174c5ed14afb5caaba4a32467b366d3c9d3a70d7a88b9e1df"
+    },
+    {
+      "path": "src/rom_stubs.c",
+      "sha256": "e6c3b29a93c7537dabb92fa689e96b8fc204f7acdb13ffc630c0a61d9ea0d647"
+    },
+    {
+      "path": "src/rom_stubs.h",
+      "sha256": "73176d4be1b16ea8528b32422f7cf0eecb1968b9080f5727b98bac619e1c0e4a"
+    },
+    {
+      "path": "src/rtc_cntl.c",
+      "sha256": "73e8a1f94c6eeb23fa0e50ed7025f64c9571abb9bf67af37ec940cff4714bc70"
+    },
+    {
+      "path": "src/rtc_cntl.h",
+      "sha256": "e47c76146c16202b3655535a902c6c68ad2bb32ed4c494679a390d6dafa71f54"
+    },
+    {
+      "path": "src/rtc_io.c",
+      "sha256": "eecd1b305e00ee562459eadddfc67c906a8a9eeb5160c5ae852a50e3b3d49c7f"
+    },
+    {
+      "path": "src/rtc_io.h",
+      "sha256": "fe12e100e05b0e22a906d586bfb62e8c418a4a14037f929a4e22d21e4494fdc2"
+    },
+    {
+      "path": "src/sandbox_events.c",
+      "sha256": "18be761ce0941d5acbb030cdd65f3b6e105ddf563248de9a23f8c213023bd9c6"
+    },
+    {
+      "path": "src/sandbox_events.h",
+      "sha256": "ec20d8864c11b47db0db69df87605c097956a330006bb7702e827de82cca1b54"
+    },
+    {
+      "path": "src/sandbox_input.c",
+      "sha256": "985dd9fb7fc562cd4e22309bdbcb796094fd04010fa6263e44af16aaff4f0092"
+    },
+    {
+      "path": "src/sandbox_input.h",
+      "sha256": "138c1df72d0b78c50750db3b9499377fb34a2524cb708a0a6c7a6f921c3dff68"
+    },
+    {
+      "path": "src/savestate.c",
+      "sha256": "dd85e40c46025b15d3497526d78bf2d7924cece878224173578e74240d24e0f0"
+    },
+    {
+      "path": "src/savestate.h",
+      "sha256": "ade15f93ea028dd382170a7b5b5fa23561051107a056f8fea43f8e863edaeb7a"
+    },
+    {
+      "path": "src/sdcard_stubs.c",
+      "sha256": "3568408a3f1815e1402c2c586421ce70a0cbcabb3aed9afdce0bb2193bb7da0e"
+    },
+    {
+      "path": "src/sdcard_stubs.h",
+      "sha256": "7b3a8e75b194d0b230dc243b1c83c1cb6638bf624566ca88ab4974e81c32c695"
+    },
+    {
+      "path": "src/sens.c",
+      "sha256": "30f3c462ecdd5c9730bfe280dcc1e9671e70b8c4d34b7b1b9dbc9add14147d7b"
+    },
+    {
+      "path": "src/sens.h",
+      "sha256": "41c1aabd25d6261c1b7ed9c326793a85cbfc8324b1a9eed2d546961b06ce9b19"
+    },
+    {
+      "path": "src/sensitive_memprot.c",
+      "sha256": "9deac9519fe405c24e89efe255e15fc8ac81fab258d8c7b4bc9fcb6fe4bcd011"
+    },
+    {
+      "path": "src/sensitive_memprot.h",
+      "sha256": "2827e499851c89813a1b61db9ab5d03e1cae0fec129433593b0c430d22071028"
+    },
+    {
+      "path": "src/sha_stubs.c",
+      "sha256": "71ca02e55c116b840438c3801e85d775854370c5436e1aed87628e24b05de3c7"
+    },
+    {
+      "path": "src/sha_stubs.h",
+      "sha256": "68d6ee0517165382c3c546abb5572b8a566910c45023ee76e4d9d754b0195c4a"
+    },
+    {
+      "path": "src/spi_display.c",
+      "sha256": "2ec26486f7a35d63f633cca2657bcd5db65ad0c81b54b0d54c5cffbf1d769ec0"
+    },
+    {
+      "path": "src/spi_display.h",
+      "sha256": "2749252ae2039bd63194455b75a35f2e485d5660ef1d79479787595ea8e5eb21"
+    },
+    {
+      "path": "src/spi_mem.c",
+      "sha256": "5fc2d49536c7a50655e04ffab32ccfb27840bf4b7aa9a833f3abc2e5566b7c06"
+    },
+    {
+      "path": "src/spi_mem.h",
+      "sha256": "5e16017991d6aef393bb0cf8cbb0fe9fae2d5e36d6fce67b9982b5a72a530fb6"
+    },
+    {
+      "path": "src/sx127x.c",
+      "sha256": "fee4daac7a25f9c06844d942d50c278a803b5774687fdb126a6b8d23d4208864"
+    },
+    {
+      "path": "src/sx127x.h",
+      "sha256": "f006fa1c17ffa949f18fa6a4181aa130ed19232961ed77db4320dd9d1bedba36"
+    },
+    {
+      "path": "src/syscon_memory.c",
+      "sha256": "99bc4c24622871f531d91244d09b16700ec068b1d34156e00d38da3169635787"
+    },
+    {
+      "path": "src/syscon_memory.h",
+      "sha256": "c1bd6438588785602c0469042f70e5b613c025818b14918dfdc8134745e57f84"
+    },
+    {
+      "path": "src/system_clock.c",
+      "sha256": "9fc58e96dac83ab2d1396aa8de6dcce79234788a370b807f83d6b7ecb6953420"
+    },
+    {
+      "path": "src/system_clock.h",
+      "sha256": "80bd50ae23bb6afbe4272cc3bcb24bbb1b35257bbcdb59163536104568118775"
+    },
+    {
+      "path": "src/systimer.c",
+      "sha256": "bbc3f48f6cd52d85b264066362fbd62a841f2a3f8db3d6e8d4c90f0d6d2765dd"
+    },
+    {
+      "path": "src/systimer.h",
+      "sha256": "0cbc962583728fcc9f66aa2cfa542d5577c54efbbe5da3a9ed01b0a3b503d47a"
+    },
+    {
+      "path": "src/target.c",
+      "sha256": "83444564bf25df3b6e257863230c138401fd72477241b525ed5258ef647b23e0"
+    },
+    {
+      "path": "src/target.h",
+      "sha256": "39e34e6bb58dfecf9ae4fbea042b809677ea1ea2519be927415d25162df36480"
+    },
+    {
+      "path": "src/target_types.h",
+      "sha256": "0d26140356b402997f6a19a9901c6a2346912ef52d25416ddbe84be1b4d864a6"
+    },
+    {
+      "path": "src/timer_group.c",
+      "sha256": "b0b661224d4ff0c69bf08381087eaf0defdcca4f069bbd47bc6c153c50150be8"
+    },
+    {
+      "path": "src/timer_group.h",
+      "sha256": "1df38a16793db6f89d69d2d597ed77c499565973c52a236ee2d362dc4c79cb02"
+    },
+    {
+      "path": "src/touch_stubs.c",
+      "sha256": "d95817e216c44bcd64521683f0c12830c61c42448d77e7a6e3d63a41d08fad1b"
+    },
+    {
+      "path": "src/touch_stubs.h",
+      "sha256": "c08ca43c0c7c23481326e941ecdf00593e64e52a5e3bed630391c51c446884d2"
+    },
+    {
+      "path": "src/touch_v2.c",
+      "sha256": "c349ee39673bb798c242223f9c3f5e1112649358e3826be2f0d5c07ed9413e06"
+    },
+    {
+      "path": "src/touch_v2.h",
+      "sha256": "b623eee1cda918d1c9db37320c8195ab12a6f4fe79272d7565af7c7d0ea7729d"
+    },
+    {
+      "path": "src/ublox_gps.c",
+      "sha256": "d9a008806307877a3091f3b3949b5a62653deb17cc7adea8387be0270b9ee2fa"
+    },
+    {
+      "path": "src/ublox_gps.h",
+      "sha256": "1fae0bf3c5941864487d5f750222e27da8f60b70b0e0e8c8a7212240e54dabe2"
+    },
+    {
+      "path": "src/usb_serial_jtag.c",
+      "sha256": "9cb1ff8c4e600de3751f609d6de6d9e3f1460928fcd80a00f9622420b971b773"
+    },
+    {
+      "path": "src/usb_serial_jtag.h",
+      "sha256": "f7ba09753b21a2b9cee1cf4347bc18a7975fc9b41e4dbcda9f083488f0b0588d"
+    },
+    {
+      "path": "src/vfs_stubs.c",
+      "sha256": "363086f512fd3bc1cc550b42208427f9a8394c2fc4f47fc6f9263fe2cf003ae9"
+    },
+    {
+      "path": "src/vfs_stubs.h",
+      "sha256": "3bd498e1351f2c2c9752793695448f885657e969098769dbf97ef84ccbd6bd1d"
+    },
+    {
+      "path": "src/wifi_stubs.c",
+      "sha256": "285d431bf65906668333d060eaa8e7650c4a4fd8317d410a795f89dcf190e1b5"
+    },
+    {
+      "path": "src/wifi_stubs.h",
+      "sha256": "01ad88f621c05f10dc833786fb5334d1336d9aafb99d2e77daa2ee3fef8c7b04"
+    },
+    {
+      "path": "src/window_accel.c",
+      "sha256": "f0a761812d3505002f6f11eb81504deda5a48ffcdcfa61d5358be10c202a6504"
+    },
+    {
+      "path": "src/xtensa.c",
+      "sha256": "7cb3d058a595bc70fff4eea4865d69e71e7e219e99fff2e73faec70a180fb849"
+    },
+    {
+      "path": "src/xtensa.h",
+      "sha256": "551e4cb37c88f0c3dd9177eba358ca887f1c169d238f70f84c072acc5f3aae9f"
+    },
+    {
+      "path": "src/xtensa_disasm.c",
+      "sha256": "144b729d99122883b75660513625e7c416fa09a2414dbc497623a74ab19067c1"
+    }
+  ]
+}

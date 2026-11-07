@@ -1,0 +1,23 @@
+Flexe Agon Emulator
+
+Derived from Fab Agon Emulator by Tom Morton and contributors.
+Fab-derived combined emulator distributions are covered by GNU GPL version 3;
+see LICENSE and LICENSING.md. Preserve all upstream copyright, licence and
+warranty notices. Do not describe the complete program as MIT-only.
+
+Original modifications and additions copyright (c) 2026 Brandon Gates are also
+offered under MIT to the extent he owns them; see LICENSE-MIT and MODIFICATIONS.md.
+This grant does not relicense inherited or third-party material.
+
+The eZ80 CPU lineage includes Tom Morton and Iván Izaguirre (BSD-3-Clause).
+Flexe is copyright (c) 2026 Lev Kropp (MIT).
+Agon MOS/VDP lineage includes Dean Belfield, Lennart Benschop, Steve Sims,
+Jeroen Venema and the wider Agon developer community. Platform/firmware credit
+is distinct from authorship of this emulator's frontend or ESP32 engine.
+
+Full named credits, source evidence and component notices are in CREDITS.md,
+LICENSES/, and docs/third-party-components.json. Required third-party notices
+must accompany the actual distribution. This summary does not replace them.
+
+This is an independently maintained derivative. Mentioning an upstream author
+or project does not imply sponsorship, endorsement or approval of this fork.

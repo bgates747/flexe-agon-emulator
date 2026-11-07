@@ -1,0 +1,161 @@
+#ifndef ROM_STUBS_H
+#define ROM_STUBS_H
+
+#include "xtensa.h"
+#include "elf_symbols.h"
+#include <stdint.h>
+
+/* Forward declarations */
+typedef struct esp32_periph esp32_periph_t;
+
+typedef struct esp32_rom_stubs esp32_rom_stubs_t;
+typedef void (*rom_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
+/* Return the number of guest instructions represented after fully handling
+ * the call (including the guest return), or zero to observe it and let the
+ * firmware implementation execute. */
+typedef int (*rom_conditional_stub_fn)(xtensa_cpu_t *cpu, void *user_ctx);
+
+typedef enum {
+    ROM_FIRMWARE_UNKNOWN = 0,
+    ROM_FIRMWARE_NERDMINER_V183,
+    /* Official v1.12.1 CYD 2432S028 2-USB image, built with
+     * Arduino-ESP32 3.3.4 / ESP-IDF 5.5.1 and NimBLE-Arduino 2.3.8. */
+    ROM_FIRMWARE_MARAUDER_V1121_CYD2USB,
+    ROM_FIRMWARE_MARAUDER_V1140_1,
+    ROM_FIRMWARE_MARAUDER_V1142_3,
+    ROM_FIRMWARE_MARAUDER_V1151,
+    /* v1.14.3 built for other CYD boards. Same sources, separate
+     * links: entry 0x400830D0 and their own address maps. */
+    ROM_FIRMWARE_MARAUDER_V1143_GUITION,
+    ROM_FIRMWARE_MARAUDER_V1143_35INCH,
+    /* WLED 16.0.1 for plain ESP32. Its esp_wifi entry points were located by
+     * masked-signature matching against a locally built Arduino-ESP32 2.0.17
+     * sketch -- the same core version WLED links (both report IDF 4.4.8) --
+     * rather than by hand. */
+    ROM_FIRMWARE_WLED_V1601,
+    /* openHASP 0.7.0-rc13 for the Lanbon L8, built with the release's pinned
+     * Arduino-ESP32 2.0.14 / ESP-IDF 4.4 platform. */
+    ROM_FIRMWARE_OPENHASP_V070RC13_LANBON_L8,
+    /* Official Tasmota 15.6.0 tasmota32 release, built with
+     * Arduino-ESP32 3.3.8 / ESP-IDF 5.5.2. */
+    ROM_FIRMWARE_TASMOTA32_V1560,
+} rom_firmware_profile_t;
+
+esp32_rom_stubs_t *rom_stubs_create(xtensa_cpu_t *cpu);
+void rom_stubs_destroy(esp32_rom_stubs_t *stubs);
+int  rom_stubs_register(esp32_rom_stubs_t *stubs, uint32_t addr,
+                        rom_stub_fn fn, const char *name);
+int  rom_stubs_register_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
+                             rom_stub_fn fn, const char *name, void *user_ctx);
+int  rom_stubs_register_spy(esp32_rom_stubs_t *stubs, uint32_t addr,
+                             rom_stub_fn fn, const char *name, void *user_ctx);
+int  rom_stubs_register_conditional_ctx(
+                             esp32_rom_stubs_t *stubs, uint32_t addr,
+                             rom_conditional_stub_fn fn, const char *name,
+                             void *user_ctx);
+/* Structurally discovered bodies already identify the exact ENTRY address;
+ * these variants deliberately bypass the legacy post-ENTRY ELF-symbol
+ * compatibility scan. */
+int  rom_stubs_register_exact_ctx(esp32_rom_stubs_t *stubs, uint32_t addr,
+                                  rom_stub_fn fn, const char *name,
+                                  void *user_ctx);
+int  rom_stubs_register_conditional_exact_ctx(
+                             esp32_rom_stubs_t *stubs, uint32_t addr,
+                             rom_conditional_stub_fn fn, const char *name,
+                             void *user_ctx);
+/* Register a structurally discovered accelerator without replacing a hook
+ * already installed at the same entry point.  Explicit/symbol-backed hooks
+ * therefore retain semantic ownership regardless of discovery order.
+ * Returns 0 when installed, 1 when an existing hook was retained, and -1 on
+ * invalid input or capacity exhaustion. */
+int  rom_stubs_register_conditional_exact_if_absent_ctx(
+                             esp32_rom_stubs_t *stubs, uint32_t addr,
+                             rom_conditional_stub_fn fn, const char *name,
+                             void *user_ctx);
+
+/* Output capture (ets_printf / ets_write_char go here) */
+int  rom_stubs_output_count(const esp32_rom_stubs_t *stubs);
+const char *rom_stubs_output_buf(const esp32_rom_stubs_t *stubs);
+void rom_stubs_output_clear(esp32_rom_stubs_t *stubs);
+
+/* Allocate/free guest-visible memory from the same capability-aware arenas
+ * used by the firmware heap hooks. Compatibility subsystems that replace a
+ * guest container still need stable pointers the guest can dereference. */
+uint32_t rom_stubs_heap_alloc_caps(esp32_rom_stubs_t *stubs, uint32_t size,
+                                   uint32_t caps);
+void rom_stubs_heap_free(esp32_rom_stubs_t *stubs, uint32_t ptr);
+
+/* Verbose logging callback (called before each ROM stub executes) */
+typedef void (*rom_log_fn)(void *ctx, uint32_t addr, const char *name,
+                           const xtensa_cpu_t *cpu);
+void rom_stubs_set_log_callback(esp32_rom_stubs_t *stubs, rom_log_fn fn, void *ctx);
+
+/* Statistics: iterate over stubs with call counts */
+int rom_stubs_stub_count(const esp32_rom_stubs_t *stubs);
+int rom_stubs_get_stats(const esp32_rom_stubs_t *stubs, int index,
+                        const char **name_out, uint32_t *addr_out, uint32_t *count_out);
+
+/* Hook known firmware functions by symbol name (e.g. newlib locks) */
+int rom_stubs_hook_symbols(esp32_rom_stubs_t *stubs, const elf_symbols_t *syms);
+int rom_stubs_hook_firmware_addrs(esp32_rom_stubs_t *stubs, uint32_t entry_point);
+rom_firmware_profile_t rom_stubs_identify_firmware(
+        esp32_rom_stubs_t *stubs, uint32_t entry_point);
+rom_firmware_profile_t rom_stubs_firmware_profile(
+        const esp32_rom_stubs_t *stubs);
+
+/* Total stub calls (running counter across all stubs) */
+uint32_t rom_stubs_total_calls(const esp32_rom_stubs_t *stubs);
+
+/* Count of unregistered ROM calls (fallback handler) */
+int rom_stubs_unregistered_count(const esp32_rom_stubs_t *stubs);
+
+/* PC hook bitmap: fast test to skip pc_hook calls for non-hooked addresses.
+ * Covers instruction-space addresses (word-aligned, >> 2) with possible
+ * false positives but no false negatives. */
+#define HOOK_BITMAP_BITS  (1u << 19)  /* 512K bits = 64KB */
+#define HOOK_BITMAP_WORDS (HOOK_BITMAP_BITS / 64)
+
+static inline int rom_stubs_hook_bitmap_test(const uint64_t *bitmap, uint32_t pc) {
+    uint32_t idx = (pc >> 2) & (HOOK_BITMAP_BITS - 1);
+    return (bitmap[idx / 64] >> (idx & 63)) & 1;
+}
+
+/* Get the hook bitmap pointer (for use in hot path) */
+const uint64_t *rom_stubs_get_hook_bitmap(const esp32_rom_stubs_t *stubs);
+
+/* ---- Direct dispatch table (fast stub lookup) ----
+ * Replaces bitmap + hash for the hot path. Indexed by (pc >> 2) & MASK.
+ * On hit (fn != NULL and tag matches), call fn directly — no hash needed.
+ * On miss, falls through to normal rom_pc_hook for ROM range interception. */
+#define STUB_DIRECT_BITS  16            /* 64K entries */
+#define STUB_DIRECT_SIZE  (1u << STUB_DIRECT_BITS)
+#define STUB_DIRECT_MASK  (STUB_DIRECT_SIZE - 1)
+
+typedef struct {
+    uint32_t    tag;     /* full PC for collision detection */
+    rom_stub_fn fn;      /* stub function (NULL = empty slot) */
+    rom_conditional_stub_fn conditional_fn;
+    void       *ctx;     /* context pointer */
+    uint32_t   *call_count; /* pointer to entry's call_count for stats */
+    int         spy;     /* spy hook: run fn, then let the real instruction
+                          * execute (fast path must return 0, like the slow
+                          * path does) */
+} stub_direct_entry_t;
+
+/* Native FreeRTOS mode: skip interrupt/lock stubs */
+void rom_stubs_set_native_freertos(esp32_rom_stubs_t *stubs, bool native);
+
+/* Attach peripheral state (needed for intr_matrix_set in native mode) */
+void rom_stubs_set_periph(esp32_rom_stubs_t *stubs, esp32_periph_t *periph);
+
+/* Let unregistered mask-ROM entries execute from a successfully loaded
+ * official ROM ELF. Registered hardware/service shims still take priority. */
+void rom_stubs_set_real_rom(esp32_rom_stubs_t *stubs, bool enabled);
+
+/* Dual-core boot support */
+void rom_stubs_set_single_core(esp32_rom_stubs_t *stubs, bool single_core);
+bool rom_stubs_app_cpu_start_requested(const esp32_rom_stubs_t *stubs);
+uint32_t rom_stubs_app_cpu_boot_addr(const esp32_rom_stubs_t *stubs);
+void rom_stubs_clear_app_cpu_start(esp32_rom_stubs_t *stubs);
+
+#endif /* ROM_STUBS_H */

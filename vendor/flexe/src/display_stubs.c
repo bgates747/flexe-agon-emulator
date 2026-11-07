@@ -1,0 +1,2381 @@
+#include "display_stubs.h"
+#include "rom_stubs.h"
+#include "memory.h"
+#include "sandbox_events.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+/* Display dimensions */
+#define DISP_W 320
+#define DISP_H 240
+
+/* Embedded 8x16 VGA font (printable ASCII 32-126) */
+#define FONT_W      8
+#define FONT_H      16
+#define FONT_FIRST  32
+#define FONT_LAST   126
+
+static const uint8_t font_8x16[95][16] = {
+    /* 32 ' ' */ { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 33 '!' */ { 0x00,0x00,0x18,0x3C,0x3C,0x3C,0x18,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00 },
+    /* 34 '"' */ { 0x00,0x66,0x66,0x66,0x24,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 35 '#' */ { 0x00,0x00,0x00,0x6C,0x6C,0xFE,0x6C,0xFE,0x6C,0x6C,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 36 '$' */ { 0x18,0x18,0x7C,0xC6,0xC2,0xC0,0x7C,0x06,0x06,0x86,0xC6,0x7C,0x18,0x18,0x00,0x00 },
+    /* 37 '%' */ { 0x00,0x00,0x00,0x00,0xC2,0xC6,0x0C,0x18,0x30,0x60,0xC6,0x86,0x00,0x00,0x00,0x00 },
+    /* 38 '&' */ { 0x00,0x00,0x38,0x6C,0x6C,0x38,0x76,0xDC,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00 },
+    /* 39 ''' */ { 0x00,0x30,0x30,0x30,0x60,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 40 '(' */ { 0x00,0x00,0x0C,0x18,0x30,0x30,0x30,0x30,0x30,0x30,0x18,0x0C,0x00,0x00,0x00,0x00 },
+    /* 41 ')' */ { 0x00,0x00,0x30,0x18,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x18,0x30,0x00,0x00,0x00,0x00 },
+    /* 42 '*' */ { 0x00,0x00,0x00,0x00,0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 43 '+' */ { 0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x7E,0x18,0x18,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 44 ',' */ { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x18,0x30,0x00,0x00,0x00 },
+    /* 45 '-' */ { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFE,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 46 '.' */ { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x00 },
+    /* 47 '/' */ { 0x00,0x00,0x00,0x00,0x02,0x06,0x0C,0x18,0x30,0x60,0xC0,0x80,0x00,0x00,0x00,0x00 },
+    /* 48 '0' */ { 0x00,0x00,0x7C,0xC6,0xC6,0xCE,0xDE,0xF6,0xE6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /* 49 '1' */ { 0x00,0x00,0x18,0x38,0x78,0x18,0x18,0x18,0x18,0x18,0x18,0x7E,0x00,0x00,0x00,0x00 },
+    /* 50 '2' */ { 0x00,0x00,0x7C,0xC6,0x06,0x0C,0x18,0x30,0x60,0xC0,0xC6,0xFE,0x00,0x00,0x00,0x00 },
+    /* 51 '3' */ { 0x00,0x00,0x7C,0xC6,0x06,0x06,0x3C,0x06,0x06,0x06,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /* 52 '4' */ { 0x00,0x00,0x0C,0x1C,0x3C,0x6C,0xCC,0xFE,0x0C,0x0C,0x0C,0x1E,0x00,0x00,0x00,0x00 },
+    /* 53 '5' */ { 0x00,0x00,0xFE,0xC0,0xC0,0xC0,0xFC,0x06,0x06,0x06,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /* 54 '6' */ { 0x00,0x00,0x38,0x60,0xC0,0xC0,0xFC,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /* 55 '7' */ { 0x00,0x00,0xFE,0xC6,0x06,0x06,0x0C,0x18,0x30,0x30,0x30,0x30,0x00,0x00,0x00,0x00 },
+    /* 56 '8' */ { 0x00,0x00,0x7C,0xC6,0xC6,0xC6,0x7C,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /* 57 '9' */ { 0x00,0x00,0x7C,0xC6,0xC6,0xC6,0x7E,0x06,0x06,0x06,0x0C,0x78,0x00,0x00,0x00,0x00 },
+    /* 58 ':' */ { 0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x00,0x00 },
+    /* 59 ';' */ { 0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x18,0x18,0x30,0x00,0x00,0x00,0x00 },
+    /* 60 '<' */ { 0x00,0x00,0x00,0x06,0x0C,0x18,0x30,0x60,0x30,0x18,0x0C,0x06,0x00,0x00,0x00,0x00 },
+    /* 61 '=' */ { 0x00,0x00,0x00,0x00,0x00,0x7E,0x00,0x00,0x7E,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 62 '>' */ { 0x00,0x00,0x00,0x60,0x30,0x18,0x0C,0x06,0x0C,0x18,0x30,0x60,0x00,0x00,0x00,0x00 },
+    /* 63 '?' */ { 0x00,0x00,0x7C,0xC6,0xC6,0x0C,0x18,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00 },
+    /* 64 '@' */ { 0x00,0x00,0x00,0x7C,0xC6,0xC6,0xDE,0xDE,0xDE,0xDC,0xC0,0x7C,0x00,0x00,0x00,0x00 },
+    /* 65 'A' */ { 0x00,0x00,0x10,0x38,0x6C,0xC6,0xC6,0xFE,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00 },
+    /* 66 'B' */ { 0x00,0x00,0xFC,0x66,0x66,0x66,0x7C,0x66,0x66,0x66,0x66,0xFC,0x00,0x00,0x00,0x00 },
+    /* 67 'C' */ { 0x00,0x00,0x3C,0x66,0xC2,0xC0,0xC0,0xC0,0xC0,0xC2,0x66,0x3C,0x00,0x00,0x00,0x00 },
+    /* 68 'D' */ { 0x00,0x00,0xF8,0x6C,0x66,0x66,0x66,0x66,0x66,0x66,0x6C,0xF8,0x00,0x00,0x00,0x00 },
+    /* 69 'E' */ { 0x00,0x00,0xFE,0x66,0x62,0x68,0x78,0x68,0x60,0x62,0x66,0xFE,0x00,0x00,0x00,0x00 },
+    /* 70 'F' */ { 0x00,0x00,0xFE,0x66,0x62,0x68,0x78,0x68,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00 },
+    /* 71 'G' */ { 0x00,0x00,0x3C,0x66,0xC2,0xC0,0xC0,0xDE,0xC6,0xC6,0x66,0x3A,0x00,0x00,0x00,0x00 },
+    /* 72 'H' */ { 0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xFE,0xC6,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00 },
+    /* 73 'I' */ { 0x00,0x00,0x3C,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00 },
+    /* 74 'J' */ { 0x00,0x00,0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0xCC,0xCC,0xCC,0x78,0x00,0x00,0x00,0x00 },
+    /* 75 'K' */ { 0x00,0x00,0xE6,0x66,0x66,0x6C,0x78,0x78,0x6C,0x66,0x66,0xE6,0x00,0x00,0x00,0x00 },
+    /* 76 'L' */ { 0x00,0x00,0xF0,0x60,0x60,0x60,0x60,0x60,0x60,0x62,0x66,0xFE,0x00,0x00,0x00,0x00 },
+    /* 77 'M' */ { 0x00,0x00,0xC6,0xEE,0xFE,0xFE,0xD6,0xC6,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00 },
+    /* 78 'N' */ { 0x00,0x00,0xC6,0xE6,0xF6,0xFE,0xDE,0xCE,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00 },
+    /* 79 'O' */ { 0x00,0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /* 80 'P' */ { 0x00,0x00,0xFC,0x66,0x66,0x66,0x7C,0x60,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00 },
+    /* 81 'Q' */ { 0x00,0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xD6,0xDE,0x7C,0x0C,0x0E,0x00,0x00 },
+    /* 82 'R' */ { 0x00,0x00,0xFC,0x66,0x66,0x66,0x7C,0x6C,0x66,0x66,0x66,0xE6,0x00,0x00,0x00,0x00 },
+    /* 83 'S' */ { 0x00,0x00,0x7C,0xC6,0xC6,0x60,0x38,0x0C,0x06,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /* 84 'T' */ { 0x00,0x00,0xFF,0xDB,0x99,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00 },
+    /* 85 'U' */ { 0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /* 86 'V' */ { 0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x6C,0x38,0x10,0x00,0x00,0x00,0x00 },
+    /* 87 'W' */ { 0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xD6,0xD6,0xD6,0xFE,0xEE,0x6C,0x00,0x00,0x00,0x00 },
+    /* 88 'X' */ { 0x00,0x00,0xC6,0xC6,0x6C,0x7C,0x38,0x38,0x7C,0x6C,0xC6,0xC6,0x00,0x00,0x00,0x00 },
+    /* 89 'Y' */ { 0x00,0x00,0xCC,0xCC,0xCC,0xCC,0x78,0x30,0x30,0x30,0x30,0x78,0x00,0x00,0x00,0x00 },
+    /* 90 'Z' */ { 0x00,0x00,0xFE,0xC6,0x86,0x0C,0x18,0x30,0x60,0xC2,0xC6,0xFE,0x00,0x00,0x00,0x00 },
+    /* 91 '[' */ { 0x00,0x00,0x3C,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x3C,0x00,0x00,0x00,0x00 },
+    /* 92 '\' */ { 0x00,0x00,0x00,0x80,0xC0,0xE0,0x70,0x38,0x1C,0x0E,0x06,0x02,0x00,0x00,0x00,0x00 },
+    /* 93 ']' */ { 0x00,0x00,0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x3C,0x00,0x00,0x00,0x00 },
+    /* 94 '^' */ { 0x10,0x38,0x6C,0xC6,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 95 '_' */ { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0x00,0x00 },
+    /* 96 '`' */ { 0x30,0x30,0x18,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
+    /* 97 'a' */ { 0x00,0x00,0x00,0x00,0x00,0x78,0x0C,0x7C,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00 },
+    /* 98 'b' */ { 0x00,0x00,0xE0,0x60,0x60,0x78,0x6C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00 },
+    /* 99 'c' */ { 0x00,0x00,0x00,0x00,0x00,0x7C,0xC6,0xC0,0xC0,0xC0,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /*100 'd' */ { 0x00,0x00,0x1C,0x0C,0x0C,0x3C,0x6C,0xCC,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00 },
+    /*101 'e' */ { 0x00,0x00,0x00,0x00,0x00,0x7C,0xC6,0xFE,0xC0,0xC0,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /*102 'f' */ { 0x00,0x00,0x38,0x6C,0x64,0x60,0xF0,0x60,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00 },
+    /*103 'g' */ { 0x00,0x00,0x00,0x00,0x00,0x76,0xCC,0xCC,0xCC,0xCC,0xCC,0x7C,0x0C,0xCC,0x78,0x00 },
+    /*104 'h' */ { 0x00,0x00,0xE0,0x60,0x60,0x6C,0x76,0x66,0x66,0x66,0x66,0xE6,0x00,0x00,0x00,0x00 },
+    /*105 'i' */ { 0x00,0x00,0x18,0x18,0x00,0x38,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00 },
+    /*106 'j' */ { 0x00,0x00,0x06,0x06,0x00,0x0E,0x06,0x06,0x06,0x06,0x06,0x06,0x66,0x66,0x3C,0x00 },
+    /*107 'k' */ { 0x00,0x00,0xE0,0x60,0x60,0x66,0x6C,0x78,0x78,0x6C,0x66,0xE6,0x00,0x00,0x00,0x00 },
+    /*108 'l' */ { 0x00,0x00,0x38,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00 },
+    /*109 'm' */ { 0x00,0x00,0x00,0x00,0x00,0xEC,0xFE,0xD6,0xD6,0xD6,0xD6,0xC6,0x00,0x00,0x00,0x00 },
+    /*110 'n' */ { 0x00,0x00,0x00,0x00,0x00,0xDC,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00 },
+    /*111 'o' */ { 0x00,0x00,0x00,0x00,0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /*112 'p' */ { 0x00,0x00,0x00,0x00,0x00,0xDC,0x66,0x66,0x66,0x66,0x66,0x7C,0x60,0x60,0xF0,0x00 },
+    /*113 'q' */ { 0x00,0x00,0x00,0x00,0x00,0x76,0xCC,0xCC,0xCC,0xCC,0xCC,0x7C,0x0C,0x0C,0x1E,0x00 },
+    /*114 'r' */ { 0x00,0x00,0x00,0x00,0x00,0xDC,0x76,0x66,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00 },
+    /*115 's' */ { 0x00,0x00,0x00,0x00,0x00,0x7C,0xC6,0x60,0x38,0x0C,0xC6,0x7C,0x00,0x00,0x00,0x00 },
+    /*116 't' */ { 0x00,0x00,0x10,0x30,0x30,0xFC,0x30,0x30,0x30,0x30,0x36,0x1C,0x00,0x00,0x00,0x00 },
+    /*117 'u' */ { 0x00,0x00,0x00,0x00,0x00,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00 },
+    /*118 'v' */ { 0x00,0x00,0x00,0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0x6C,0x38,0x00,0x00,0x00,0x00 },
+    /*119 'w' */ { 0x00,0x00,0x00,0x00,0x00,0xC6,0xC6,0xD6,0xD6,0xD6,0xFE,0x6C,0x00,0x00,0x00,0x00 },
+    /*120 'x' */ { 0x00,0x00,0x00,0x00,0x00,0xC6,0x6C,0x38,0x38,0x38,0x6C,0xC6,0x00,0x00,0x00,0x00 },
+    /*121 'y' */ { 0x00,0x00,0x00,0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7E,0x06,0x0C,0xF8,0x00 },
+    /*122 'z' */ { 0x00,0x00,0x00,0x00,0x00,0xFE,0xCC,0x18,0x30,0x60,0xC6,0xFE,0x00,0x00,0x00,0x00 },
+    /*123 '{' */ { 0x00,0x00,0x0E,0x18,0x18,0x18,0x70,0x18,0x18,0x18,0x18,0x0E,0x00,0x00,0x00,0x00 },
+    /*124 '|' */ { 0x00,0x00,0x18,0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00 },
+    /*125 '}' */ { 0x00,0x00,0x70,0x18,0x18,0x18,0x0E,0x18,0x18,0x18,0x18,0x70,0x00,0x00,0x00,0x00 },
+    /*126 '~' */ { 0x00,0x00,0x76,0xDC,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },
+};
+
+/* ===== GFXFont support =====
+ *
+ * GFXfont (Adafruit GFX) struct layout in ESP32 memory (32-bit LE):
+ *   +0: uint8_t  *bitmap   (4 bytes) — packed 1-bit glyph bitmaps
+ *   +4: GFXglyph *glyph    (4 bytes) — array of glyph descriptors
+ *   +8: uint16_t  first     — first character code
+ *  +10: uint16_t  last      — last character code
+ *  +12: uint8_t   yAdvance  — line spacing
+ *
+ * GFXglyph struct (sizeof = 8, 7 data + 1 padding):
+ *   +0: uint16_t bitmapOffset
+ *   +2: uint8_t  width
+ *   +3: uint8_t  height
+ *   +4: uint8_t  xAdvance
+ *   +5: int8_t   xOffset
+ *   +6: int8_t   yOffset
+ */
+#define GFXFONT_OFF_BITMAP    0
+#define GFXFONT_OFF_GLYPH     4
+#define GFXFONT_OFF_FIRST     8
+#define GFXFONT_OFF_LAST     10
+#define GFXFONT_OFF_YADVANCE 12
+
+/* TFT_eSPI GFXglyph uses uint32_t bitmapOffset (not uint16_t like Adafruit GFX),
+ * so sizeof(GFXglyph) = 12 on ESP32 (4+1+1+1+1+1 + 3 padding). */
+#define GFXGLYPH_SIZEOF       12
+#define GFXGLYPH_OFF_BMOFF    0   /* uint32_t */
+#define GFXGLYPH_OFF_WIDTH    4
+#define GFXGLYPH_OFF_HEIGHT   5
+#define GFXGLYPH_OFF_XADV     6
+#define GFXGLYPH_OFF_XOFF     7
+#define GFXGLYPH_OFF_YOFF     8
+
+/* Render one GFXfont glyph to any pixel buffer. Returns xAdvance*scale. */
+static int render_gfxfont_glyph(uint16_t *buf, int buf_w, int buf_h,
+                                 xtensa_mem_t *mem, uint32_t font_ptr,
+                                 int cx, int cy, uint8_t ch,
+                                 uint16_t fg, int scale) {
+    uint16_t first = mem_read16(mem, font_ptr + GFXFONT_OFF_FIRST);
+    uint16_t last  = mem_read16(mem, font_ptr + GFXFONT_OFF_LAST);
+    if (ch < first || ch > last) return FONT_W * scale; /* fallback advance */
+
+    uint32_t glyph_base = mem_read32(mem, font_ptr + GFXFONT_OFF_GLYPH);
+    uint32_t ga = glyph_base + (uint32_t)(ch - first) * GFXGLYPH_SIZEOF;
+
+    uint32_t bm_off  = mem_read32(mem, ga + GFXGLYPH_OFF_BMOFF);
+    uint8_t  gw      = mem_read8(mem, ga + GFXGLYPH_OFF_WIDTH);
+    uint8_t  gh      = mem_read8(mem, ga + GFXGLYPH_OFF_HEIGHT);
+    uint8_t  xadv    = mem_read8(mem, ga + GFXGLYPH_OFF_XADV);
+    int8_t   xoff    = (int8_t)mem_read8(mem, ga + GFXGLYPH_OFF_XOFF);
+    int8_t   yoff    = (int8_t)mem_read8(mem, ga + GFXGLYPH_OFF_YOFF);
+
+    uint32_t bm_base = mem_read32(mem, font_ptr + GFXFONT_OFF_BITMAP);
+    uint32_t baddr   = bm_base + bm_off;
+
+    uint8_t bits = 0;
+    int bitpos = 0;
+    for (int yy = 0; yy < gh; yy++) {
+        for (int xx = 0; xx < gw; xx++) {
+            if (!(bitpos & 7))
+                bits = mem_read8(mem, baddr + (uint32_t)(bitpos >> 3));
+            if (bits & 0x80) {
+                for (int sy = 0; sy < scale; sy++) {
+                    int dy = cy + (yoff + yy) * scale + sy;
+                    if (dy < 0 || dy >= buf_h) { continue; }
+                    for (int sx = 0; sx < scale; sx++) {
+                        int dx = cx + (xoff + xx) * scale + sx;
+                        if (dx < 0 || dx >= buf_w) continue;
+                        buf[dy * buf_w + dx] = fg;
+                    }
+                }
+            }
+            bits <<= 1;
+            bitpos++;
+        }
+    }
+    return xadv * scale;
+}
+
+/* Measure string width using GFXFont metrics */
+static int gfxfont_text_width(xtensa_mem_t *mem, uint32_t font_ptr,
+                               uint32_t str_addr, int scale) {
+    uint16_t first = mem_read16(mem, font_ptr + GFXFONT_OFF_FIRST);
+    uint16_t last  = mem_read16(mem, font_ptr + GFXFONT_OFF_LAST);
+    uint32_t glyph_base = mem_read32(mem, font_ptr + GFXFONT_OFF_GLYPH);
+    int total = 0;
+    for (;;) {
+        uint8_t ch = mem_read8(mem, str_addr++);
+        if (ch == 0) break;
+        if (ch < first || ch > last) continue;
+        uint32_t ga = glyph_base + (uint32_t)(ch - first) * GFXGLYPH_SIZEOF;
+        total += mem_read8(mem, ga + GFXGLYPH_OFF_XADV) * scale;
+    }
+    return total;
+}
+
+/* Get line height from GFXFont */
+static int gfxfont_height(xtensa_mem_t *mem, uint32_t font_ptr, int scale) {
+    return mem_read8(mem, font_ptr + GFXFONT_OFF_YADVANCE) * scale;
+}
+
+/* ===== TFT_eSPI built-in font support =====
+ *
+ * TFT_eSPI's fontdata[9] array stores per-font metadata:
+ *   struct { uint32_t chartbl, widthtbl; uint8_t height, baseline; }
+ * packed to 12 bytes per entry (2 pointers + 2 bytes + 2 padding).
+ * Font numbers 1-8 map to fontdata[0]-fontdata[7].
+ *
+ * Font 1 (GLCD): 5x7 columnar bitmap (256 chars × 5 bytes), fixed 6px cell.
+ * Font 2: Row-major bitmap, MSB-left, variable width, 16px height.
+ * Fonts 4,6,7,8: RLE encoded, variable width, various heights.
+ */
+
+#define FONTDATA_ENTRY_SIZE 12  /* sizeof in firmware memory */
+
+typedef struct {
+    uint32_t chartbl;    /* pointer to character bitmap table */
+    uint32_t widthtbl;   /* pointer to per-char width table */
+    uint8_t  height;     /* font height in pixels */
+    uint8_t  baseline;   /* baseline offset from top */
+} fontdata_entry_t;
+
+static fontdata_entry_t read_fontdata(xtensa_mem_t *mem, uint32_t base, int font) {
+    fontdata_entry_t fd = {0};
+    if (font < 1 || font > 8) return fd;
+    /* fontdata[0] is unused padding; fontdata[font] has the actual data */
+    uint32_t addr = base + (uint32_t)font * FONTDATA_ENTRY_SIZE;
+    fd.chartbl  = mem_read32(mem, addr);
+    fd.widthtbl = mem_read32(mem, addr + 4);
+    fd.height   = mem_read8(mem, addr + 8);
+    fd.baseline = mem_read8(mem, addr + 9);
+    return fd;
+}
+
+/* Get single character width from firmware width table */
+static int builtin_char_width(xtensa_mem_t *mem, const fontdata_entry_t *fd, uint8_t ch, int font) {
+    if (font == 1) return 6;  /* GLCD: fixed 6px (5 glyph + 1 gap) */
+    if (ch < 32 || !fd->widthtbl) return 0;
+    return mem_read8(mem, fd->widthtbl + (uint32_t)(ch - 32));
+}
+
+/* Measure string width using firmware font data */
+static int builtin_text_width(xtensa_mem_t *mem, uint32_t fontdata_addr,
+                               int font, uint32_t str_addr, int scale) {
+    fontdata_entry_t fd = read_fontdata(mem, fontdata_addr, font);
+    int total = 0;
+    for (;;) {
+        uint8_t ch = mem_read8(mem, str_addr++);
+        if (ch == 0) break;
+        total += builtin_char_width(mem, &fd, ch, font) * scale;
+    }
+    return total;
+}
+
+/* Get font height from firmware font data */
+static int builtin_font_height(xtensa_mem_t *mem, uint32_t fontdata_addr,
+                                int font, int scale) {
+    fontdata_entry_t fd = read_fontdata(mem, fontdata_addr, font);
+    return fd.height * scale;
+}
+
+/* Render GLCD Font 1 glyph (5x8 columnar, LSB=top row, 256 chars × 5 bytes).
+ * Returns cell width in pixels (6 * scale). */
+static int render_glcd_glyph(uint16_t *buf, int buf_w, int buf_h,
+                              xtensa_mem_t *mem, uint32_t chartbl,
+                              int cx, int cy, uint8_t ch,
+                              uint16_t fg, uint16_t bg, int scale,
+                              int draw_bg) {
+    /* chartbl is a flat 256×5 array: font[ch*5 .. ch*5+4] */
+    uint32_t gaddr = chartbl + (uint32_t)ch * 5;
+    for (int col = 0; col < 5; col++) {
+        uint8_t column = mem_read8(mem, gaddr + (uint32_t)col);
+        for (int row = 0; row < 8; row++) {
+            int set = (column >> row) & 1;
+            if (!set && !draw_bg) continue;
+            uint16_t pix = set ? fg : bg;
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= buf_h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= buf_w) continue;
+                    buf[dy * buf_w + dx] = pix;
+                }
+            }
+        }
+    }
+    /* Column 6 is the inter-character gap (background only) */
+    if (draw_bg) {
+        for (int row = 0; row < 8; row++) {
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= buf_h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + 5 * scale + sx;
+                    if (dx < 0 || dx >= buf_w) continue;
+                    buf[dy * buf_w + dx] = bg;
+                }
+            }
+        }
+    }
+    return 6 * scale;
+}
+
+/* Render Font 2 glyph (row-major bitmap, MSB-left, variable width, 16px height).
+ * chartbl[ch-32] is a uint32_t pointer to the bitmap. */
+static int render_font2_glyph(uint16_t *buf, int buf_w, int buf_h,
+                                xtensa_mem_t *mem, const fontdata_entry_t *fd,
+                                int cx, int cy, uint8_t ch,
+                                uint16_t fg, uint16_t bg, int scale,
+                                int draw_bg) {
+    if (ch < 32) return 0;
+    int idx = ch - 32;
+    /* chartbl is a table of uint32_t pointers, one per character */
+    uint32_t bm_ptr = mem_read32(mem, fd->chartbl + (uint32_t)(idx * 4));
+    int width = mem_read8(mem, fd->widthtbl + (uint32_t)idx);
+    if (width == 0 || !bm_ptr) return 0;
+    int bytes_per_row = (width + 7) / 8;  /* Standard bit-packing: (width + 7) / 8 */
+    int height = fd->height;
+
+    for (int row = 0; row < height; row++) {
+        for (int col = 0; col < width; col++) {
+            int byte_idx = col / 8;
+            int bit_idx = 7 - (col % 8);
+            uint8_t byte = mem_read8(mem, bm_ptr + (uint32_t)(row * bytes_per_row + byte_idx));
+            int set = (byte >> bit_idx) & 1;
+            if (!set && !draw_bg) continue;
+            uint16_t pix = set ? fg : bg;
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= buf_h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= buf_w) continue;
+                    buf[dy * buf_w + dx] = pix;
+                }
+            }
+        }
+    }
+    return width * scale;
+}
+
+/* Render RLE-encoded glyph (Fonts 4,6,7,8).
+ * RLE format: byte & 0x80 → foreground run (length = low 7 bits + 1),
+ *             else background run (length = byte + 1).
+ * Total pixels = width × height, row-major. */
+static int render_rle_glyph(uint16_t *buf, int buf_w, int buf_h,
+                              xtensa_mem_t *mem, const fontdata_entry_t *fd,
+                              int cx, int cy, uint8_t ch,
+                              uint16_t fg, uint16_t bg, int scale,
+                              int draw_bg) {
+    if (ch < 32) return 0;
+    int idx = ch - 32;
+    uint32_t bm_ptr = mem_read32(mem, fd->chartbl + (uint32_t)(idx * 4));
+    int width = mem_read8(mem, fd->widthtbl + (uint32_t)idx);
+    if (width == 0 || !bm_ptr) return 0;
+    int height = fd->height;
+    int total_pixels = width * height;
+
+    uint32_t rle_addr = bm_ptr;
+    int pixel = 0;
+    while (pixel < total_pixels) {
+        uint8_t rle_byte = mem_read8(mem, rle_addr++);
+        int is_fg = rle_byte & 0x80;
+        int run_len = is_fg ? (rle_byte & 0x7F) + 1 : rle_byte + 1;
+        uint16_t pix = is_fg ? fg : bg;
+        int should_draw = is_fg || draw_bg;
+        for (int i = 0; i < run_len && pixel < total_pixels; i++, pixel++) {
+            if (!should_draw) continue;
+            int row = pixel / width;
+            int col = pixel % width;
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= buf_h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= buf_w) continue;
+                    buf[dy * buf_w + dx] = pix;
+                }
+            }
+        }
+    }
+    return width * scale;
+}
+
+/* Dispatch to the correct built-in font renderer.
+ * Returns glyph advance width in pixels.
+ * Falls back to 8x16 VGA font if fontdata_addr is 0. */
+static int render_builtin_glyph(uint16_t *buf, int buf_w, int buf_h,
+                                  xtensa_mem_t *mem, uint32_t fontdata_addr,
+                                  uint32_t glcd_font_addr,
+                                  int font, int cx, int cy, uint8_t ch,
+                                  uint16_t fg, uint16_t bg, int scale,
+                                  int draw_bg) {
+    if (!fontdata_addr || font < 1 || font > 8) {
+        /* Fallback to embedded 8x16 VGA font */
+        char c = (ch < FONT_FIRST || ch > FONT_LAST) ? ' ' : (char)ch;
+        const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+        for (int row = 0; row < FONT_H; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < FONT_W; col++) {
+                int set = bits & (0x80 >> col);
+                if (!set && !draw_bg) continue;
+                uint16_t pix = set ? fg : bg;
+                for (int sy = 0; sy < scale; sy++) {
+                    int dy = cy + row * scale + sy;
+                    if (dy < 0 || dy >= buf_h) continue;
+                    for (int sx = 0; sx < scale; sx++) {
+                        int dx = cx + col * scale + sx;
+                        if (dx < 0 || dx >= buf_w) continue;
+                        buf[dy * buf_w + dx] = pix;
+                    }
+                }
+            }
+        }
+        return FONT_W * scale;
+    }
+
+    fontdata_entry_t fd = read_fontdata(mem, fontdata_addr, font);
+    switch (font) {
+    case 1: {
+        /* Font 1 (GLCD) uses the global font[] array, NOT fontdata[1].chartbl.
+         * TFT_eSPI renders GLCD directly from font[]. Use glcd_font_addr if
+         * available, otherwise fall back to fontdata[0].chartbl which happens
+         * to store the correct address in some firmware builds. */
+        uint32_t chartbl = glcd_font_addr ? glcd_font_addr : fd.chartbl;
+        return render_glcd_glyph(buf, buf_w, buf_h, mem, chartbl,
+                                  cx, cy, ch, fg, bg, scale, draw_bg);
+    }
+    case 2:
+        return render_font2_glyph(buf, buf_w, buf_h, mem, &fd,
+                                   cx, cy, ch, fg, bg, scale, draw_bg);
+    case 4: case 6: case 7: case 8:
+        return render_rle_glyph(buf, buf_w, buf_h, mem, &fd,
+                                 cx, cy, ch, fg, bg, scale, draw_bg);
+    default:
+        /* Fonts 3, 5 don't exist in TFT_eSPI — fall back */
+        return FONT_W * scale;
+    }
+}
+
+/* ===== Sprite support ===== */
+#define MAX_SPRITES 16
+
+typedef struct {
+    uint32_t  this_ptr;    /* C++ 'this' pointer — sprite identity */
+    int16_t   w, h;
+    uint16_t *buf;         /* host-side pixel buffer (malloc'd) */
+    /* setWindow cursor state for pushColor */
+    int       win_x1, win_y1, win_x2, win_y2;
+    int       win_cx, win_cy;
+    /* text state */
+    uint16_t  textcolor, textbgcolor;
+    uint8_t   textsize;
+    uint8_t   textfont;        /* built-in font number 1-8 */
+    uint32_t  gfxfont_ptr;   /* GFXfont pointer (0 = built-in font) */
+} sprite_t;
+
+struct display_stubs {
+    xtensa_cpu_t       *cpu;
+    esp32_rom_stubs_t  *rom;
+    uint16_t           *framebuf;
+    pthread_mutex_t    *framebuf_mtx;
+    int                 width;
+    int                 height;
+    int                 native_w;    /* original dimensions from set_framebuf */
+    int                 native_h;
+    /* TFT_eSPI state tracking */
+    uint16_t            textcolor;
+    uint16_t            textbgcolor;
+    uint8_t             textsize;
+    uint8_t             textdatum;
+    uint8_t             textfont;        /* current built-in font number 1-8 */
+    uint8_t             rotation;
+    uint32_t            gfxfont_ptr;     /* GFXfont pointer (0 = built-in font) */
+    uint32_t            fontdata_addr;   /* address of fontdata[] in firmware flash */
+    uint32_t            glcd_font_addr;  /* address of GLCD font[] bitmap (256×5 bytes) */
+    /* Sprite table */
+    sprite_t            sprites[MAX_SPRITES];
+    int                 sprite_count;
+    /* Most recently created sprite — used as render target for
+     * OpenFontRender hooks that don't carry a sprite pointer. */
+    sprite_t           *active_sprite;
+};
+
+/* ===== Calling convention helpers ===== */
+
+static uint32_t ds_arg(xtensa_cpu_t *cpu, int n) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    /* Max register args: min(6, 16 - first_arg_reg).
+     * For CALL8 (ci=2): first_arg = a10, max = 6.
+     * For CALL4 (ci=1): first_arg = a6,  max = 6 (really 10 but ABI caps at 6).
+     * For CALL0 (ci=0): a2-a7 = 6. */
+    int first_arg = ci * 4 + 2;
+    int max_reg = 16 - first_arg;
+    if (max_reg > 6) max_reg = 6;
+    if (n < max_reg)
+        return ar_read(cpu, first_arg + n);
+    /* Extra args beyond register capacity are on the caller's stack.
+     * Hook fires before ENTRY, so SP (a1) is still the caller's SP.
+     * Stack args start at [SP + 0] for the first extra arg. */
+    uint32_t sp = ar_read(cpu, 1);
+    return mem_read32(cpu->mem, sp + (uint32_t)((n - max_reg) * 4));
+}
+
+static void ds_return_void(xtensa_cpu_t *cpu) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    if (ci > 0) {
+        uint32_t a0 = ar_read(cpu, ci * 4);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+        XT_PS_SET_CALLINC(cpu->ps, 0);
+    } else {
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
+    }
+}
+
+static void ds_return(xtensa_cpu_t *cpu, uint32_t val) {
+    int ci = XT_PS_CALLINC(cpu->ps);
+    if (ci > 0) {
+        ar_write(cpu, ci * 4 + 2, val);
+        uint32_t a0 = ar_read(cpu, ci * 4);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (a0 & 0x3FFFFFFFu);
+        XT_PS_SET_CALLINC(cpu->ps, 0);
+    } else {
+        ar_write(cpu, 2, val);
+        cpu->pc = (cpu->pc & 0xC0000000u) | (ar_read(cpu, 0) & 0x3FFFFFFFu);
+    }
+}
+
+/* Forward declaration (defined in sprite section below) */
+static sprite_t *find_sprite(display_stubs_t *ds, uint32_t this_ptr);
+
+/* ===== Display stub implementations ===== */
+
+static void stub_display_init(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+static void stub_display_clear(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint16_t color = (uint16_t)ds_arg(cpu, 0);
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int i = 0; i < ds->width * ds->height; i++)
+            ds->framebuf[i] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+static void stub_display_fill_rect(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 0);
+    int y = (int32_t)ds_arg(cpu, 1);
+    int w = (int32_t)ds_arg(cpu, 2);
+    int h = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    /* Clip */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > ds->width)  w = ds->width - x;
+    if (y + h > ds->height) h = ds->height - y;
+    if (w <= 0 || h <= 0) { ds_return_void(cpu); return; }
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int row = y; row < y + h; row++) {
+            uint16_t *dst = &ds->framebuf[row * ds->width + x];
+            for (int i = 0; i < w; i++)
+                dst[i] = color;
+        }
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+static void stub_display_char(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 0);
+    int y = (int32_t)ds_arg(cpu, 1);
+    char c = (char)(ds_arg(cpu, 2) & 0xFF);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 3);
+    uint16_t bg = (uint16_t)ds_arg(cpu, 4);
+
+    if (c < FONT_FIRST || c > FONT_LAST) c = ' ';
+    const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int row = 0; row < FONT_H; row++) {
+            int dy = y + row;
+            if (dy < 0 || dy >= ds->height) continue;
+            if (x < 0 || x + FONT_W > ds->width) continue;
+            uint8_t bits = glyph[row];
+            uint16_t *dst = &ds->framebuf[dy * ds->width + x];
+            for (int col = 0; col < FONT_W; col++)
+                dst[col] = (bits & (0x80 >> col)) ? fg : bg;
+        }
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+static void stub_display_string(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 0);
+    int y = (int32_t)ds_arg(cpu, 1);
+    uint32_t str_addr = ds_arg(cpu, 2);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 3);
+    uint16_t bg = (uint16_t)ds_arg(cpu, 4);
+
+    if (!ds->framebuf || !ds->framebuf_mtx) { ds_return_void(cpu); return; }
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    int cx = x, cy = y;
+    for (;;) {
+        uint8_t ch = mem_read8(cpu->mem, str_addr++);
+        if (ch == 0) break;
+        if (ch == '\n') {
+            cx = x;
+            cy += FONT_H;
+            continue;
+        }
+        if (cx + FONT_W > ds->width) {
+            cx = 0;
+            cy += FONT_H;
+        }
+        if (cy + FONT_H > ds->height) break;
+
+        char c = (char)ch;
+        if (c < FONT_FIRST || c > FONT_LAST) c = ' ';
+        const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+        for (int row = 0; row < FONT_H; row++) {
+            int dy = cy + row;
+            if (dy < 0 || dy >= ds->height) continue;
+            if (cx < 0 || cx + FONT_W > ds->width) continue;
+            uint8_t bits = glyph[row];
+            uint16_t *dst = &ds->framebuf[dy * ds->width + cx];
+            for (int col = 0; col < FONT_W; col++)
+                dst[col] = (bits & (0x80 >> col)) ? fg : bg;
+        }
+        cx += FONT_W;
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+static void stub_display_draw_bitmap1bpp(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 0);
+    int y = (int32_t)ds_arg(cpu, 1);
+    int w = (int32_t)ds_arg(cpu, 2);
+    int h = (int32_t)ds_arg(cpu, 3);
+    uint32_t bmp_addr = ds_arg(cpu, 4);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 5);
+    uint16_t bg = (uint16_t)ds_arg(cpu, 6);
+
+    int row_bytes = (w + 7) / 8;
+
+    if (!ds->framebuf || !ds->framebuf_mtx) { ds_return_void(cpu); return; }
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    for (int row = 0; row < h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= ds->height) continue;
+        for (int col = 0; col < w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= ds->width) continue;
+            uint8_t byte = mem_read8(cpu->mem, bmp_addr + (uint32_t)(row * row_bytes + col / 8));
+            int bit = byte & (0x80 >> (col & 7));
+            ds->framebuf[dy * ds->width + dx] = bit ? fg : bg;
+        }
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+static void stub_display_draw_rgb565_line(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 0);
+    int y = (int32_t)ds_arg(cpu, 1);
+    int w = (int32_t)ds_arg(cpu, 2);
+    uint32_t pix_addr = ds_arg(cpu, 3);
+
+    if (y < 0 || y >= ds->height || w <= 0) { ds_return_void(cpu); return; }
+    int skip = 0;
+    if (x < 0) { skip = -x; w += x; x = 0; }
+    if (x + w > ds->width) w = ds->width - x;
+    if (w <= 0) { ds_return_void(cpu); return; }
+
+    if (!ds->framebuf || !ds->framebuf_mtx) { ds_return_void(cpu); return; }
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    uint16_t *dst = &ds->framebuf[y * ds->width + x];
+    uint32_t src = pix_addr + (uint32_t)(skip * 2);
+    for (int i = 0; i < w; i++) {
+        /* Read 16-bit LE pixel from emulator memory */
+        uint8_t lo = mem_read8(cpu->mem, src);
+        uint8_t hi = mem_read8(cpu->mem, src + 1);
+        dst[i] = (uint16_t)((hi << 8) | lo);
+        src += 2;
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+/* ===== TFT_eSPI C++ method stubs =====
+ *
+ * For C++ member functions, arg0 = this pointer. Actual parameters start at
+ * arg1.  We ignore 'this' and work directly with the emulator framebuffer. */
+
+/* TFT_eSPI::fillScreen(unsigned int color) */
+static void stub_tft_fillScreen(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint16_t color = (uint16_t)ds_arg(cpu, 1);  /* arg0=this, arg1=color */
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int i = 0; i < ds->width * ds->height; i++)
+            ds->framebuf[i] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::fillRect(int x, int y, int w, int h, unsigned int color) */
+static void stub_tft_fillRect(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint16_t color = (uint16_t)ds_arg(cpu, 5);
+
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > ds->width)  w = ds->width - x;
+    if (y + h > ds->height) h = ds->height - y;
+    if (w <= 0 || h <= 0) { ds_return_void(cpu); return; }
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int row = y; row < y + h; row++) {
+            uint16_t *dst = &ds->framebuf[row * ds->width + x];
+            for (int i = 0; i < w; i++)
+                dst[i] = color;
+        }
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawPixel(int x, int y, unsigned int color) */
+static void stub_tft_drawPixel(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    uint16_t color = (uint16_t)ds_arg(cpu, 3);
+
+    if (x >= 0 && x < ds->width && y >= 0 && y < ds->height &&
+        ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        ds->framebuf[y * ds->width + x] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawFastHLine(int x, int y, int w, unsigned int color) */
+static void stub_tft_drawFastHLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    if (y < 0 || y >= ds->height || w <= 0) { ds_return_void(cpu); return; }
+    if (x < 0) { w += x; x = 0; }
+    if (x + w > ds->width) w = ds->width - x;
+    if (w <= 0) { ds_return_void(cpu); return; }
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        uint16_t *dst = &ds->framebuf[y * ds->width + x];
+        for (int i = 0; i < w; i++)
+            dst[i] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawFastVLine(int x, int y, int h, unsigned int color) */
+static void stub_tft_drawFastVLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int h = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    if (x < 0 || x >= ds->width || h <= 0) { ds_return_void(cpu); return; }
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > ds->height) h = ds->height - y;
+    if (h <= 0) { ds_return_void(cpu); return; }
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        for (int row = y; row < y + h; row++)
+            ds->framebuf[row * ds->width + x] = color;
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawRect(int x, int y, int w, int h, unsigned int color) */
+static void stub_tft_drawRect(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint16_t color = (uint16_t)ds_arg(cpu, 5);
+
+    if (w <= 0 || h <= 0 || !ds->framebuf || !ds->framebuf_mtx) {
+        ds_return_void(cpu); return;
+    }
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    /* Top and bottom edges */
+    for (int i = 0; i < w; i++) {
+        int px = x + i;
+        if (px >= 0 && px < ds->width) {
+            if (y >= 0 && y < ds->height)
+                ds->framebuf[y * ds->width + px] = color;
+            int by = y + h - 1;
+            if (by >= 0 && by < ds->height)
+                ds->framebuf[by * ds->width + px] = color;
+        }
+    }
+    /* Left and right edges */
+    for (int i = 1; i < h - 1; i++) {
+        int py = y + i;
+        if (py >= 0 && py < ds->height) {
+            if (x >= 0 && x < ds->width)
+                ds->framebuf[py * ds->width + x] = color;
+            int rx = x + w - 1;
+            if (rx >= 0 && rx < ds->width)
+                ds->framebuf[py * ds->width + rx] = color;
+        }
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::pushImage(int x, int y, int w, int h, const uint16_t *data) */
+static void stub_tft_pushImage(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint32_t data_addr = ds_arg(cpu, 5);
+
+    if (w <= 0 || h <= 0 || !ds->framebuf || !ds->framebuf_mtx) {
+        ds_return_void(cpu); return;
+    }
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    for (int row = 0; row < h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= ds->height) continue;
+        for (int col = 0; col < w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= ds->width) continue;
+            uint32_t src = data_addr + (uint32_t)((row * w + col) * 2);
+            uint8_t lo = mem_read8(cpu->mem, src);
+            uint8_t hi = mem_read8(cpu->mem, src + 1);
+            ds->framebuf[dy * ds->width + dx] = (uint16_t)((hi << 8) | lo);
+        }
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::drawString(const char *str, int x, int y, unsigned char font)
+ * Returns int16_t pixel width of rendered string.
+ * Also handles sprite targets (TFT_eSprite inherits drawString). */
+static void stub_tft_drawString(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    uint32_t str_addr = ds_arg(cpu, 1);
+    int x = (int32_t)ds_arg(cpu, 2);
+    int y = (int32_t)ds_arg(cpu, 3);
+    /* arg4 = font number (optional, defaults to current textfont) */
+    uint8_t font_arg = (uint8_t)(ds_arg(cpu, 4) & 0xFF);
+
+    sprite_t *sp = find_sprite(ds, this_ptr);
+    uint16_t *buf   = sp ? sp->buf       : ds->framebuf;
+    int buf_w       = sp ? sp->w         : ds->width;
+    int buf_h       = sp ? sp->h         : ds->height;
+    uint16_t fg     = sp ? sp->textcolor : ds->textcolor;
+    uint16_t bg     = sp ? sp->textbgcolor : ds->textbgcolor;
+    int scale       = sp ? (sp->textsize > 0 ? sp->textsize : 1)
+                         : (ds->textsize > 0 ? ds->textsize : 1);
+    uint32_t font_ptr = sp ? sp->gfxfont_ptr : ds->gfxfont_ptr;
+    int textfont    = sp ? sp->textfont : ds->textfont;
+    /* If font arg is valid (1-8), use it; otherwise use current textfont */
+    if (font_arg >= 1 && font_arg <= 8) textfont = font_arg;
+
+    if (!buf) { ds_return(cpu, 0); return; }
+    if (!sp && ds->framebuf_mtx) pthread_mutex_lock(ds->framebuf_mtx);
+
+    int total_w = 0;
+
+    if (font_ptr) {
+        /* GFXFont rendering (foreground only, transparent background) */
+        total_w = gfxfont_text_width(cpu->mem, font_ptr, str_addr, scale);
+
+        /* Text datum alignment */
+        uint8_t datum = ds->textdatum;
+        if (datum == 1 || datum == 4 || datum == 7 ||
+            datum == 10) x -= total_w / 2;
+        else if (datum == 2 || datum == 5 || datum == 8 ||
+                 datum == 11) x -= total_w;
+        int fh = gfxfont_height(cpu->mem, font_ptr, scale);
+        if (datum >= 3 && datum <= 5)
+            y -= fh / 2;
+        else if (datum >= 6 && datum <= 8)
+            y -= fh;
+
+        int cx = x;
+        uint32_t addr = str_addr;
+        for (;;) {
+            uint8_t ch = mem_read8(cpu->mem, addr++);
+            if (ch == 0) break;
+            cx += render_gfxfont_glyph(buf, buf_w, buf_h, cpu->mem,
+                                        font_ptr, cx, y, ch, fg, scale);
+        }
+    } else {
+        /* Built-in font rendering */
+        uint8_t datum = sp ? 0 : ds->textdatum;
+
+        /* Measure string width for datum alignment */
+        if (datum) {
+            if (ds->fontdata_addr)
+                total_w = builtin_text_width(cpu->mem, ds->fontdata_addr,
+                                              textfont, str_addr, scale);
+            else {
+                int slen = 0;
+                uint32_t sa = str_addr;
+                for (;;) { uint8_t ch = mem_read8(cpu->mem, sa++); if (!ch) break; slen++; }
+                total_w = slen * FONT_W * scale;
+            }
+            int tw = total_w;
+            /* Horizontal datum: 0,3,6,9=left  1,4,7,10=center  2,5,8,11=right */
+            if (datum == 1 || datum == 4 || datum == 7 ||
+                datum == 10) x -= tw / 2;
+            else if (datum == 2 || datum == 5 || datum == 8 ||
+                     datum == 11) x -= tw;
+            /* Vertical datum: 0-2=top  3-5=middle  6-8=bottom  9-11=baseline */
+            int fh = ds->fontdata_addr ?
+                     builtin_font_height(cpu->mem, ds->fontdata_addr, textfont, scale)
+                     : FONT_H * scale;
+            if (datum >= 3 && datum <= 5)
+                y -= fh / 2;
+            else if (datum >= 6 && datum <= 8)
+                y -= fh;
+            else if (datum >= 9 && datum <= 11) {
+                /* Baseline alignment */
+                if (ds->fontdata_addr) {
+                    fontdata_entry_t fd = read_fontdata(cpu->mem, ds->fontdata_addr, textfont);
+                    y -= fd.baseline * scale;
+                } else {
+                    y -= 13 * scale;  /* approximate baseline for 8x16 font */
+                }
+            }
+        }
+
+        total_w = 0;
+        int cx = x;
+        for (;;) {
+            uint8_t ch = mem_read8(cpu->mem, str_addr++);
+            if (ch == 0) break;
+            if (ch == '\n') {
+                int fh = ds->fontdata_addr ?
+                         builtin_font_height(cpu->mem, ds->fontdata_addr, textfont, scale)
+                         : FONT_H * scale;
+                cx = x; y += fh; continue;
+            }
+            int adv = render_builtin_glyph(buf, buf_w, buf_h, cpu->mem,
+                                            ds->fontdata_addr,
+                                            ds->glcd_font_addr, textfont,
+                                            cx, y, ch, fg, bg, scale, 1);
+            cx += adv;
+            total_w += adv;
+        }
+    }
+
+    if (!sp && ds->framebuf_mtx) pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return(cpu, (uint32_t)total_w);
+}
+
+/* TFT_eSPI::drawChar(unsigned short c, int x, int y)
+ * Uses current textcolor/textbgcolor/textsize/textfont. */
+static void stub_tft_drawChar_3(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint8_t c = (uint8_t)(ds_arg(cpu, 1) & 0xFF);
+    int x = (int32_t)ds_arg(cpu, 2);
+    int y = (int32_t)ds_arg(cpu, 3);
+
+    int scale = ds->textsize > 0 ? ds->textsize : 1;
+
+    int width = FONT_W * scale;
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        if (ds->gfxfont_ptr) {
+            width = render_gfxfont_glyph(ds->framebuf, ds->width, ds->height,
+                                          cpu->mem, ds->gfxfont_ptr,
+                                          x, y, c, ds->textcolor, scale);
+        } else {
+            width = render_builtin_glyph(ds->framebuf, ds->width, ds->height,
+                                          cpu->mem, ds->fontdata_addr,
+                                          ds->glcd_font_addr,
+                                          ds->textfont, x, y, c,
+                                          ds->textcolor, ds->textbgcolor,
+                                          scale, 1);
+        }
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return(cpu, (uint32_t)width);
+}
+
+/* TFT_eSPI::drawChar(unsigned short c, int x, int y, unsigned char font)
+ * 4-param version: font arg explicitly selects a built-in font (1-8).
+ * Always uses built-in font renderer, never GFXFont (TFT_eSPI behavior). */
+static void stub_tft_drawChar_4(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint8_t c = (uint8_t)(ds_arg(cpu, 1) & 0xFF);
+    int x = (int32_t)ds_arg(cpu, 2);
+    int y = (int32_t)ds_arg(cpu, 3);
+    uint8_t font = (uint8_t)(ds_arg(cpu, 4) & 0xFF);
+    if (font < 1 || font > 8) font = ds->textfont;
+
+    int scale = ds->textsize > 0 ? ds->textsize : 1;
+
+    int width = FONT_W * scale;
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        width = render_builtin_glyph(ds->framebuf, ds->width, ds->height,
+                                      cpu->mem, ds->fontdata_addr,
+                                      ds->glcd_font_addr,
+                                      font, x, y, c,
+                                      ds->textcolor, ds->textbgcolor,
+                                      scale, 1);
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return(cpu, (uint32_t)width);
+}
+
+/* TFT_eSPI::drawChar(int x, int y, unsigned short c, unsigned int fg,
+ *                     unsigned int bg, unsigned char size) */
+static void stub_tft_drawChar_6(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    uint8_t c = (uint8_t)(ds_arg(cpu, 3) & 0xFF);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 4);
+    uint16_t bg = (uint16_t)ds_arg(cpu, 5);
+    /* arg6 = size, on stack for CALL8 */
+    int ci = XT_PS_CALLINC(cpu->ps);
+    int first_arg = ci * 4 + 2;
+    int max_reg = 16 - first_arg;
+    if (max_reg > 6) max_reg = 6;
+    uint32_t size_val;
+    if (6 < max_reg)
+        size_val = ar_read(cpu, first_arg + 6);
+    else {
+        uint32_t sp = ar_read(cpu, 1);
+        size_val = mem_read32(cpu->mem, sp + (uint32_t)((6 - max_reg) * 4));
+    }
+    int scale = size_val > 0 ? (int)size_val : 1;
+
+    int width = FONT_W * scale;
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        if (ds->gfxfont_ptr) {
+            width = render_gfxfont_glyph(ds->framebuf, ds->width, ds->height,
+                                          cpu->mem, ds->gfxfont_ptr,
+                                          x, y, c, fg, scale);
+        } else {
+            width = render_builtin_glyph(ds->framebuf, ds->width, ds->height,
+                                          cpu->mem, ds->fontdata_addr,
+                                          ds->glcd_font_addr,
+                                          ds->textfont, x, y, c,
+                                          fg, bg, scale, 1);
+        }
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return(cpu, (uint32_t)width);
+}
+
+/* TFT_eSPI::setTextColor(unsigned short fg) — also handles sprites */
+static void stub_tft_setTextColor_1(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint16_t color = (uint16_t)ds_arg(cpu, 1);
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp)
+        sp->textcolor = color;
+    else
+        ds->textcolor = color;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setTextColor(unsigned short fg, unsigned short bg, bool fillbg) */
+static void stub_tft_setTextColor_3(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint16_t fg = (uint16_t)ds_arg(cpu, 1);
+    uint16_t bg = (uint16_t)ds_arg(cpu, 2);
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        sp->textcolor = fg;
+        sp->textbgcolor = bg;
+    } else {
+        ds->textcolor = fg;
+        ds->textbgcolor = bg;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setTextSize(unsigned char size) — also handles sprites */
+static void stub_tft_setTextSize(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint8_t sz = (uint8_t)ds_arg(cpu, 1);
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp)
+        sp->textsize = sz;
+    else
+        ds->textsize = sz;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setFreeFont(const GFXfont *font) — store for GFXFont rendering */
+static void stub_tft_setFreeFont(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    uint32_t font_ptr = ds_arg(cpu, 1);
+    sprite_t *sp = find_sprite(ds, this_ptr);
+    if (sp)
+        sp->gfxfont_ptr = font_ptr;
+    else
+        ds->gfxfont_ptr = font_ptr;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setTextFont(unsigned char font) — selects built-in font, clears GFXFont */
+static void stub_tft_setTextFont(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    uint8_t font = (uint8_t)ds_arg(cpu, 1);
+    if (font < 1) font = 1;
+    if (font > 8) font = 8;
+    sprite_t *sp = find_sprite(ds, this_ptr);
+    if (sp) {
+        sp->gfxfont_ptr = 0;
+        sp->textfont = font;
+    } else {
+        ds->gfxfont_ptr = 0;
+        ds->textfont = font;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setTextDatum(unsigned char datum) */
+static void stub_tft_setTextDatum(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds->textdatum = (uint8_t)ds_arg(cpu, 1);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::setRotation(unsigned char r) */
+static void stub_tft_setRotation(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint8_t r = (uint8_t)(ds_arg(cpu, 1) & 3);
+    ds->rotation = r;
+    if (r == 0 || r == 2) {
+        /* Portrait: narrow x tall */
+        ds->width  = ds->native_h;  /* 240 */
+        ds->height = ds->native_w;  /* 320 */
+    } else {
+        /* Landscape: wide x short */
+        ds->width  = ds->native_w;  /* 320 */
+        ds->height = ds->native_h;  /* 240 */
+    }
+    ds_return_void(cpu);
+}
+
+/* Generic void return for TFT_eSPI methods we don't need to emulate */
+static void stub_tft_void(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::width() / height() — return display dimensions */
+static void stub_tft_width(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds_return(cpu, (uint32_t)ds->width);
+}
+
+static void stub_tft_height(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds_return(cpu, (uint32_t)ds->height);
+}
+
+/* ===== TFT_eSprite method stubs ===== */
+
+static sprite_t *find_sprite(display_stubs_t *ds, uint32_t this_ptr) {
+    for (int i = 0; i < ds->sprite_count; i++) {
+        if (ds->sprites[i].this_ptr == this_ptr && ds->sprites[i].buf)
+            return &ds->sprites[i];
+    }
+    return NULL;
+}
+
+static sprite_t *alloc_sprite(display_stubs_t *ds, uint32_t this_ptr) {
+    /* Reuse existing slot for same this_ptr */
+    for (int i = 0; i < ds->sprite_count; i++) {
+        if (ds->sprites[i].this_ptr == this_ptr) {
+            free(ds->sprites[i].buf);
+            ds->sprites[i].buf = NULL;
+            return &ds->sprites[i];
+        }
+    }
+    /* Find empty slot */
+    for (int i = 0; i < ds->sprite_count; i++) {
+        if (!ds->sprites[i].buf && ds->sprites[i].this_ptr == 0)
+            return &ds->sprites[i];
+    }
+    /* Append */
+    if (ds->sprite_count < MAX_SPRITES)
+        return &ds->sprites[ds->sprite_count++];
+    return NULL;
+}
+
+static void free_sprite(display_stubs_t *ds, uint32_t this_ptr) {
+    for (int i = 0; i < ds->sprite_count; i++) {
+        if (ds->sprites[i].this_ptr == this_ptr) {
+            free(ds->sprites[i].buf);
+            memset(&ds->sprites[i], 0, sizeof(sprite_t));
+        }
+    }
+}
+
+/* Bresenham line drawing into a pixel buffer */
+static void sprite_draw_line(uint16_t *buf, int sw, int sh,
+                              int x0, int y0, int x1, int y1, uint16_t color) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < sw && y0 >= 0 && y0 < sh)
+            buf[y0 * sw + x0] = color;
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* TFT_eSprite::TFT_eSprite(TFT_eSPI*) — constructor, no-op */
+static void stub_sprite_ctor(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::~TFT_eSprite() — destructor */
+static void stub_sprite_dtor(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    free_sprite(ds, this_ptr);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::createSprite(short w, short h, unsigned char depth) */
+static void stub_sprite_createSprite(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    int16_t w = (int16_t)ds_arg(cpu, 1);
+    int16_t h = (int16_t)ds_arg(cpu, 2);
+
+    sprite_t *sp = alloc_sprite(ds, this_ptr);
+    if (!sp || w <= 0 || h <= 0) {
+        ds_return(cpu, 0);
+        return;
+    }
+    sp->this_ptr = this_ptr;
+    sp->w = w;
+    sp->h = h;
+    sp->buf = calloc((size_t)w * h, sizeof(uint16_t));
+    sp->textcolor = 0xFFFF;
+    sp->textbgcolor = 0x0000;
+    sp->textsize = 1;
+    sp->textfont = 1;
+    sp->win_x1 = 0; sp->win_y1 = 0;
+    sp->win_x2 = w - 1; sp->win_y2 = h - 1;
+    sp->win_cx = 0; sp->win_cy = 0;
+    ds->active_sprite = sp->buf ? sp : NULL;
+    ds_return(cpu, sp->buf ? 1 : 0);
+}
+
+/* TFT_eSprite::deleteSprite() */
+static void stub_sprite_deleteSprite(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    free_sprite(ds, this_ptr);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::fillSprite(unsigned int color) */
+static void stub_sprite_fillSprite(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        uint16_t color = (uint16_t)ds_arg(cpu, 1);
+        int n = sp->w * sp->h;
+        for (int i = 0; i < n; i++)
+            sp->buf[i] = color;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::fillRect(int x, int y, int w, int h, unsigned int color) */
+static void stub_sprite_fillRect(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint16_t color = (uint16_t)ds_arg(cpu, 5);
+
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > sp->w) w = sp->w - x;
+    if (y + h > sp->h) h = sp->h - y;
+    if (w <= 0 || h <= 0) { ds_return_void(cpu); return; }
+
+    for (int row = y; row < y + h; row++) {
+        uint16_t *dst = &sp->buf[row * sp->w + x];
+        for (int i = 0; i < w; i++)
+            dst[i] = color;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawPixel(int x, int y, unsigned int color) */
+static void stub_sprite_drawPixel(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        int x = (int32_t)ds_arg(cpu, 1);
+        int y = (int32_t)ds_arg(cpu, 2);
+        uint16_t color = (uint16_t)ds_arg(cpu, 3);
+        if (x >= 0 && x < sp->w && y >= 0 && y < sp->h)
+            sp->buf[y * sp->w + x] = color;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawFastHLine(int x, int y, int w, unsigned int color) */
+static void stub_sprite_drawFastHLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    if (y < 0 || y >= sp->h || w <= 0) { ds_return_void(cpu); return; }
+    if (x < 0) { w += x; x = 0; }
+    if (x + w > sp->w) w = sp->w - x;
+    if (w <= 0) { ds_return_void(cpu); return; }
+
+    uint16_t *dst = &sp->buf[y * sp->w + x];
+    for (int i = 0; i < w; i++)
+        dst[i] = color;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawFastVLine(int x, int y, int h, unsigned int color) */
+static void stub_sprite_drawFastVLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int h = (int32_t)ds_arg(cpu, 3);
+    uint16_t color = (uint16_t)ds_arg(cpu, 4);
+
+    if (x < 0 || x >= sp->w || h <= 0) { ds_return_void(cpu); return; }
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > sp->h) h = sp->h - y;
+    if (h <= 0) { ds_return_void(cpu); return; }
+
+    for (int row = y; row < y + h; row++)
+        sp->buf[row * sp->w + x] = color;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawLine(int x0, int y0, int x1, int y1, unsigned int color) */
+static void stub_sprite_drawLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        int x0 = (int32_t)ds_arg(cpu, 1);
+        int y0 = (int32_t)ds_arg(cpu, 2);
+        int x1 = (int32_t)ds_arg(cpu, 3);
+        int y1 = (int32_t)ds_arg(cpu, 4);
+        uint16_t color = (uint16_t)ds_arg(cpu, 5);
+        sprite_draw_line(sp->buf, sp->w, sp->h, x0, y0, x1, y1, color);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::pushImage(int x, int y, int w, int h, const uint16_t *data) */
+static void stub_sprite_pushImage(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    int w = (int32_t)ds_arg(cpu, 3);
+    int h = (int32_t)ds_arg(cpu, 4);
+    uint32_t data_addr = ds_arg(cpu, 5);
+
+    if (w <= 0 || h <= 0) { ds_return_void(cpu); return; }
+
+    for (int row = 0; row < h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= sp->h) continue;
+        for (int col = 0; col < w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= sp->w) continue;
+            uint32_t src = data_addr + (uint32_t)((row * w + col) * 2);
+            uint8_t lo = mem_read8(cpu->mem, src);
+            uint8_t hi = mem_read8(cpu->mem, src + 1);
+            sp->buf[dy * sp->w + dx] = (uint16_t)((hi << 8) | lo);
+        }
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::pushSprite(int x, int y) — blit sprite to display framebuffer */
+static void stub_sprite_pushSprite(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp || !ds->framebuf || !ds->framebuf_mtx) {
+        ds_return_void(cpu);
+        return;
+    }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+
+    pthread_mutex_lock(ds->framebuf_mtx);
+    for (int row = 0; row < sp->h; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= ds->height) continue;
+        for (int col = 0; col < sp->w; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= ds->width) continue;
+            ds->framebuf[dy * ds->width + dx] = sp->buf[row * sp->w + col];
+        }
+    }
+    pthread_mutex_unlock(ds->framebuf_mtx);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::setWindow(int x1, int y1, int x2, int y2) */
+static void stub_sprite_setWindow(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        sp->win_x1 = (int32_t)ds_arg(cpu, 1);
+        sp->win_y1 = (int32_t)ds_arg(cpu, 2);
+        sp->win_x2 = (int32_t)ds_arg(cpu, 3);
+        sp->win_y2 = (int32_t)ds_arg(cpu, 4);
+        sp->win_cx = sp->win_x1;
+        sp->win_cy = sp->win_y1;
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::pushColor(unsigned short color) */
+static void stub_sprite_pushColor(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        uint16_t color = (uint16_t)ds_arg(cpu, 1);
+        int x = sp->win_cx, y = sp->win_cy;
+        if (x >= 0 && x < sp->w && y >= 0 && y < sp->h)
+            sp->buf[y * sp->w + x] = color;
+        /* Advance cursor within window */
+        sp->win_cx++;
+        if (sp->win_cx > sp->win_x2) {
+            sp->win_cx = sp->win_x1;
+            sp->win_cy++;
+            if (sp->win_cy > sp->win_y2)
+                sp->win_cy = sp->win_y1;
+        }
+    }
+    ds_return_void(cpu);
+}
+
+/* Render one glyph into a sprite buffer, returns glyph pixel width */
+static int sprite_render_glyph(sprite_t *sp, int cx, int cy,
+                                char c, uint16_t fg, uint16_t bg, int scale) {
+    if (c < FONT_FIRST || c > FONT_LAST) c = ' ';
+    const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+    int gw = FONT_W * scale;
+
+    for (int row = 0; row < FONT_H; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < FONT_W; col++) {
+            uint16_t pix = (bits & (0x80 >> col)) ? fg : bg;
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= sp->h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= sp->w) continue;
+                    sp->buf[dy * sp->w + dx] = pix;
+                }
+            }
+        }
+    }
+    return gw;
+}
+
+/* TFT_eSprite::drawChar(unsigned short c, int x, int y) — 3-param */
+static void stub_sprite_drawChar_3(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        uint8_t c = (uint8_t)(ds_arg(cpu, 1) & 0xFF);
+        int x = (int32_t)ds_arg(cpu, 2);
+        int y = (int32_t)ds_arg(cpu, 3);
+        int scale = sp->textsize > 0 ? sp->textsize : 1;
+        if (sp->gfxfont_ptr)
+            render_gfxfont_glyph(sp->buf, sp->w, sp->h, cpu->mem,
+                                  sp->gfxfont_ptr, x, y, c,
+                                  sp->textcolor, scale);
+        else
+            sprite_render_glyph(sp, x, y, (char)c, sp->textcolor,
+                                 sp->textbgcolor, scale);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawChar(unsigned short c, int x, int y, unsigned char font) — 4-param */
+static void stub_sprite_drawChar_4(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        uint8_t c = (uint8_t)(ds_arg(cpu, 1) & 0xFF);
+        int x = (int32_t)ds_arg(cpu, 2);
+        int y = (int32_t)ds_arg(cpu, 3);
+        int scale = sp->textsize > 0 ? sp->textsize : 1;
+        if (sp->gfxfont_ptr)
+            render_gfxfont_glyph(sp->buf, sp->w, sp->h, cpu->mem,
+                                  sp->gfxfont_ptr, x, y, c,
+                                  sp->textcolor, scale);
+        else
+            sprite_render_glyph(sp, x, y, (char)c, sp->textcolor,
+                                 sp->textbgcolor, scale);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawChar(int x, int y, unsigned short c, unsigned int fg,
+ *                        unsigned int bg, unsigned char size) — 6-param */
+static void stub_sprite_drawChar_6(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (!sp) { ds_return_void(cpu); return; }
+
+    int x = (int32_t)ds_arg(cpu, 1);
+    int y = (int32_t)ds_arg(cpu, 2);
+    uint8_t c = (uint8_t)(ds_arg(cpu, 3) & 0xFF);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 4);
+    uint16_t bg = (uint16_t)ds_arg(cpu, 5);
+    /* arg6 = size, may be on stack */
+    int ci = XT_PS_CALLINC(cpu->ps);
+    int first_arg = ci * 4 + 2;
+    int max_reg = 16 - first_arg;
+    if (max_reg > 6) max_reg = 6;
+    uint32_t size_val;
+    if (6 < max_reg)
+        size_val = ar_read(cpu, first_arg + 6);
+    else {
+        uint32_t sp_reg = ar_read(cpu, 1);
+        size_val = mem_read32(cpu->mem, sp_reg + (uint32_t)((6 - max_reg) * 4));
+    }
+    int scale = size_val > 0 ? (int)size_val : 1;
+    if (sp->gfxfont_ptr)
+        render_gfxfont_glyph(sp->buf, sp->w, sp->h, cpu->mem,
+                              sp->gfxfont_ptr, x, y, c, fg, scale);
+    else
+        sprite_render_glyph(sp, x, y, (char)c, fg, bg, scale);
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::drawGlyph(unsigned short) — no-op (FreeFont not supported) */
+static void stub_sprite_drawGlyph(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+/* TFT_eSprite::width() */
+static void stub_sprite_width(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    ds_return(cpu, sp ? (uint32_t)sp->w : 0);
+}
+
+/* TFT_eSprite::height() */
+static void stub_sprite_height(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    ds_return(cpu, sp ? (uint32_t)sp->h : 0);
+}
+
+/* TFT_eSprite::created() */
+static void stub_sprite_created(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    ds_return(cpu, sp ? 1 : 0);
+}
+
+/* TFT_eSprite::readPixel(int x, int y) */
+static void stub_sprite_readPixel(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    sprite_t *sp = find_sprite(ds, ds_arg(cpu, 0));
+    if (sp) {
+        int x = (int32_t)ds_arg(cpu, 1);
+        int y = (int32_t)ds_arg(cpu, 2);
+        if (x >= 0 && x < sp->w && y >= 0 && y < sp->h) {
+            ds_return(cpu, sp->buf[y * sp->w + x]);
+            return;
+        }
+    }
+    ds_return(cpu, 0);
+}
+
+/* TFT_eSprite::setColorDepth(signed char) — no-op, only 16-bit supported */
+static void stub_sprite_setColorDepth(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return(cpu, 16);
+}
+
+/* TFT_eSprite::createPalette / callocSprite / begin_nin_write / end_nin_write — no-ops */
+static void stub_sprite_noop(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+static void stub_sprite_noop_ret0(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return(cpu, 0);
+}
+
+/* ===== TFT_eSPI additional stubs ===== */
+
+/* TFT_eSPI::drawLine(int x0, int y0, int x1, int y1, unsigned int color) */
+static void stub_tft_drawLine(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    int x0 = (int32_t)ds_arg(cpu, 1);
+    int y0 = (int32_t)ds_arg(cpu, 2);
+    int x1 = (int32_t)ds_arg(cpu, 3);
+    int y1 = (int32_t)ds_arg(cpu, 4);
+    uint16_t color = (uint16_t)ds_arg(cpu, 5);
+
+    if (ds->framebuf && ds->framebuf_mtx) {
+        pthread_mutex_lock(ds->framebuf_mtx);
+        sprite_draw_line(ds->framebuf, ds->width, ds->height,
+                          x0, y0, x1, y1, color);
+        pthread_mutex_unlock(ds->framebuf_mtx);
+    }
+    ds_return_void(cpu);
+}
+
+/* TFT_eSPI::textWidth(const char *str, unsigned char font) */
+static void stub_tft_textWidth(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    uint32_t str_addr = ds_arg(cpu, 1);
+    uint8_t font_arg = (uint8_t)(ds_arg(cpu, 2) & 0xFF);
+    sprite_t *sp = find_sprite(ds, this_ptr);
+    int scale = sp ? (sp->textsize > 0 ? sp->textsize : 1)
+                   : (ds->textsize > 0 ? ds->textsize : 1);
+    uint32_t font_ptr = sp ? sp->gfxfont_ptr : ds->gfxfont_ptr;
+    int textfont = sp ? sp->textfont : ds->textfont;
+    if (font_arg >= 1 && font_arg <= 8) textfont = font_arg;
+
+    if (font_ptr) {
+        ds_return(cpu, (uint32_t)gfxfont_text_width(cpu->mem, font_ptr,
+                                                      str_addr, scale));
+    } else if (ds->fontdata_addr) {
+        ds_return(cpu, (uint32_t)builtin_text_width(cpu->mem, ds->fontdata_addr,
+                                                      textfont, str_addr, scale));
+    } else {
+        int len = 0;
+        for (;;) {
+            if (mem_read8(cpu->mem, str_addr++) == 0) break;
+            len++;
+        }
+        ds_return(cpu, (uint32_t)(len * FONT_W * scale));
+    }
+}
+
+/* TFT_eSPI::fontHeight(short font) / fontHeight() */
+static void stub_tft_fontHeight(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    uint32_t this_ptr = ds_arg(cpu, 0);
+    /* fontHeight(short font) passes font as arg1; fontHeight() does not.
+     * We read arg1 and use it if valid, otherwise fall back to current font. */
+    uint8_t font_arg = (uint8_t)(ds_arg(cpu, 1) & 0xFF);
+    sprite_t *sp = find_sprite(ds, this_ptr);
+    int scale = sp ? (sp->textsize > 0 ? sp->textsize : 1)
+                   : (ds->textsize > 0 ? ds->textsize : 1);
+    uint32_t font_ptr = sp ? sp->gfxfont_ptr : ds->gfxfont_ptr;
+    int textfont = sp ? sp->textfont : ds->textfont;
+    if (font_arg >= 1 && font_arg <= 8) textfont = font_arg;
+
+    if (font_ptr)
+        ds_return(cpu, (uint32_t)gfxfont_height(cpu->mem, font_ptr, scale));
+    else if (ds->fontdata_addr)
+        ds_return(cpu, (uint32_t)builtin_font_height(cpu->mem, ds->fontdata_addr,
+                                                       textfont, scale));
+    else
+        ds_return(cpu, (uint32_t)(FONT_H * scale));
+}
+
+/* TFT_eSPI::color565(unsigned char r, unsigned char g, unsigned char b) */
+static void stub_tft_color565(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    uint8_t r = (uint8_t)ds_arg(cpu, 1);
+    uint8_t g = (uint8_t)ds_arg(cpu, 2);
+    uint8_t b = (uint8_t)ds_arg(cpu, 3);
+    uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    ds_return(cpu, c);
+}
+
+/* TFT_eSPI::getRotation() */
+static void stub_tft_getRotation(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+    ds_return(cpu, ds->rotation);
+}
+
+/* ===== OpenFontRender stubs ===== */
+
+/* OFR object field offsets (from disassembly of setters) */
+#define OFR_FONT_SIZE   136   /* uint32_t */
+#define OFR_FONT_COLOR  140   /* uint16_t */
+
+/* Render one glyph into a sprite, foreground only (transparent bg) */
+static int sprite_render_glyph_fg(sprite_t *sp, int cx, int cy,
+                                   char c, uint16_t fg, int scale) {
+    if (c < FONT_FIRST || c > FONT_LAST) c = ' ';
+    const uint8_t *glyph = font_8x16[c - FONT_FIRST];
+    int gw = FONT_W * scale;
+
+    for (int row = 0; row < FONT_H; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < FONT_W; col++) {
+            if (!(bits & (0x80 >> col))) continue;   /* skip bg */
+            for (int sy = 0; sy < scale; sy++) {
+                int dy = cy + row * scale + sy;
+                if (dy < 0 || dy >= sp->h) continue;
+                for (int sx = 0; sx < scale; sx++) {
+                    int dx = cx + col * scale + sx;
+                    if (dx < 0 || dx >= sp->w) continue;
+                    sp->buf[dy * sp->w + dx] = fg;
+                }
+            }
+        }
+    }
+    return gw;
+}
+
+/* Measure string width in bitmap font pixels */
+static int ofr_measure_string(xtensa_cpu_t *cpu, uint32_t str_addr, int gw) {
+    int len = 0;
+    for (;;) {
+        uint8_t ch = mem_read8(cpu->mem, str_addr++);
+        if (ch == 0) break;
+        len++;
+    }
+    return len * gw;
+}
+
+/* Compute bitmap font scale from OFR font size */
+static int ofr_scale(xtensa_cpu_t *cpu, uint32_t ofr_this) {
+    uint32_t sz = mem_read32(cpu->mem, ofr_this + OFR_FONT_SIZE);
+    if (sz < 8 || sz > 128) return 1;
+    return (int)((sz + 7) / 16);
+}
+
+/* Render string into active sprite with OFR-style transparent background.
+ * x_offset: 0 = left, 1 = center, 2 = right */
+static void ofr_render(xtensa_cpu_t *cpu, display_stubs_t *ds, int align) {
+    sprite_t *sp = ds->active_sprite;
+    if (!sp || !sp->buf) {
+        ds_return(cpu, 0);
+        return;
+    }
+
+    uint32_t ofr_this = ds_arg(cpu, 0);
+    uint32_t str_addr = ds_arg(cpu, 1);
+    int x = (int32_t)ds_arg(cpu, 2);
+    int y = (int32_t)ds_arg(cpu, 3);
+    uint16_t fg = (uint16_t)ds_arg(cpu, 4);
+
+    int scale = ofr_scale(cpu, ofr_this);
+    int gw = FONT_W * scale;
+
+    /* Adjust x for alignment */
+    if (align > 0) {
+        int total_w = ofr_measure_string(cpu, str_addr, gw);
+        if (align == 1) x -= total_w / 2;  /* center */
+        else            x -= total_w;       /* right */
+    }
+
+    int cx = x;
+    for (;;) {
+        uint8_t ch = mem_read8(cpu->mem, str_addr++);
+        if (ch == 0) break;
+        sprite_render_glyph_fg(sp, cx, y, (char)ch, fg, scale);
+        cx += gw;
+    }
+    ds_return(cpu, 0);   /* FT_Error = 0 (success) */
+}
+
+/* OpenFontRender::drawString  — left-aligned */
+static void stub_ofr_drawString(xtensa_cpu_t *cpu, void *ctx) {
+    ofr_render(cpu, ctx, 0);
+}
+
+/* OpenFontRender::cdrawString — center-aligned */
+static void stub_ofr_cdrawString(xtensa_cpu_t *cpu, void *ctx) {
+    ofr_render(cpu, ctx, 1);
+}
+
+/* OpenFontRender::rdrawString — right-aligned */
+static void stub_ofr_rdrawString(xtensa_cpu_t *cpu, void *ctx) {
+    ofr_render(cpu, ctx, 2);
+}
+
+/* No-op stubs for OFR config methods */
+static void stub_ofr_void(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return_void(cpu);
+}
+
+static void stub_ofr_ret0(xtensa_cpu_t *cpu, void *ctx) {
+    (void)ctx;
+    ds_return(cpu, 0);
+}
+
+/* ===== Public API ===== */
+
+display_stubs_t *display_stubs_create(xtensa_cpu_t *cpu) {
+    display_stubs_t *ds = calloc(1, sizeof(*ds));
+    if (!ds) return NULL;
+    ds->cpu = cpu;
+    ds->width = DISP_W;
+    ds->height = DISP_H;
+    ds->textcolor = 0xFFFF;   /* white */
+    ds->textbgcolor = 0x0000; /* black */
+    ds->textsize = 1;
+    ds->textfont = 1;
+    return ds;
+}
+
+void display_stubs_destroy(display_stubs_t *ds) {
+    if (!ds) return;
+    for (int i = 0; i < ds->sprite_count; i++)
+        free(ds->sprites[i].buf);
+    free(ds);
+}
+
+void display_stubs_set_framebuf(display_stubs_t *ds, uint16_t *fb,
+                                 pthread_mutex_t *mtx, int w, int h) {
+    if (!ds) return;
+    ds->framebuf = fb;
+    ds->framebuf_mtx = mtx;
+    ds->width = w;
+    ds->height = h;
+    ds->native_w = w;
+    ds->native_h = h;
+}
+
+uint8_t display_stubs_get_rotation(const display_stubs_t *ds) {
+    return ds ? ds->rotation : 1;
+}
+
+int display_stubs_get_width(const display_stubs_t *ds) {
+    return ds ? ds->width : DISP_W;
+}
+
+int display_stubs_get_height(const display_stubs_t *ds) {
+    return ds ? ds->height : DISP_H;
+}
+
+int display_stubs_hook_symbols(display_stubs_t *ds, const elf_symbols_t *syms) {
+    if (!ds || !syms) return 0;
+
+    esp32_rom_stubs_t *rom = ds->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ds->rom = rom;
+
+    int hooked = 0;
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } hooks[] = {
+        { "display_init",              stub_display_init },
+        { "display_clear",             stub_display_clear },
+        { "display_fill_rect",         stub_display_fill_rect },
+        { "display_char",              stub_display_char },
+        { "display_string",            stub_display_string },
+        { "display_draw_bitmap1bpp",   stub_display_draw_bitmap1bpp },
+        { "display_draw_rgb565_line",  stub_display_draw_rgb565_line },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, ds);
+            hooked++;
+        }
+    }
+
+    return hooked;
+}
+
+int display_stubs_hook_tft_espi(display_stubs_t *ds, const elf_symbols_t *syms) {
+    if (!ds || !syms) return 0;
+
+    esp32_rom_stubs_t *rom = ds->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ds->rom = rom;
+
+    int hooked = 0;
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } hooks[] = {
+        /* Core rendering */
+        { "_ZN8TFT_eSPI10fillScreenEj",    stub_tft_fillScreen },
+        { "_ZN8TFT_eSPI8fillRectEiiiij",   stub_tft_fillRect },
+        { "_ZN8TFT_eSPI9drawPixelEiij",    stub_tft_drawPixel },
+        { "_ZN8TFT_eSPI13drawFastHLineEiiij", stub_tft_drawFastHLine },
+        { "_ZN8TFT_eSPI13drawFastVLineEiiij", stub_tft_drawFastVLine },
+        { "_ZN8TFT_eSPI8drawRectEiiiij",   stub_tft_drawRect },
+        /* Image blitting — all overloads use same blit logic */
+        { "_ZN8TFT_eSPI9pushImageEiiiiPKt", stub_tft_pushImage },
+        { "_ZN8TFT_eSPI9pushImageEiiiiPt",  stub_tft_pushImage },
+        /* Text rendering — must be hooked because TFT_eSPI writes pixels
+         * via SPI registers internally, not through drawPixel. */
+        { "_ZN8TFT_eSPI10drawStringEPKciih", stub_tft_drawString },
+        { "_ZN8TFT_eSPI8drawCharEtii",       stub_tft_drawChar_3 },
+        { "_ZN8TFT_eSPI8drawCharEiitjjh",    stub_tft_drawChar_6 },
+        /* Font / text state */
+        { "_ZN8TFT_eSPI11setFreeFontEPK7GFXfont", stub_tft_setFreeFont },
+        { "_ZN8TFT_eSPI11setTextFontEh",     stub_tft_setTextFont },
+        { "_ZN8TFT_eSPI12setTextColorEt",    stub_tft_setTextColor_1 },
+        { "_ZN8TFT_eSPI12setTextColorEttb",  stub_tft_setTextColor_3 },
+        { "_ZN8TFT_eSPI11setTextSizeEh",     stub_tft_setTextSize },
+        { "_ZN8TFT_eSPI12setTextDatumEh",    stub_tft_setTextDatum },
+        /* Text metrics */
+        { "_ZN8TFT_eSPI9textWidthEPKch",     stub_tft_textWidth },
+        { "_ZN8TFT_eSPI10fontHeightEs",      stub_tft_fontHeight },
+        { "_ZN8TFT_eSPI10fontHeightEv",      stub_tft_fontHeight },
+        /* drawChar with 'tiih' signature — 4-param with font number */
+        { "_ZN8TFT_eSPI8drawCharEtiih",      stub_tft_drawChar_4 },
+        { "_ZN8TFT_eSPI11setRotationEh",    stub_tft_setRotation },
+        /* Dimension queries */
+        { "_ZN8TFT_eSPI4widthEv",           stub_tft_width },
+        { "_ZN8TFT_eSPI5widthEv",           stub_tft_width },
+        { "_ZN8TFT_eSPI4heightEv",          stub_tft_height },
+        { "_ZN8TFT_eSPI6heightEv",          stub_tft_height },
+        /* No-op config methods */
+        { "_ZN8TFT_eSPI4initEh",            stub_tft_void },
+        { "_ZN8TFT_eSPI7initBusEv",         stub_tft_void },
+        { "_ZN8TFT_eSPI12setSwapBytesEb",   stub_tft_void },
+        { "_ZN8TFT_eSPI11setViewportEiiiib", stub_tft_void },
+        { "_ZN8TFT_eSPI13resetViewportEv",  stub_tft_void },
+        { "_ZN8TFT_eSPI10startWriteEv",     stub_tft_void },
+        { "_ZN8TFT_eSPI8endWriteEv",        stub_tft_void },
+        { "_ZN8TFT_eSPI13invertDisplayEb",  stub_tft_void },
+        { "_ZN8TFT_eSPI10unloadFontEv",     stub_tft_void },
+        { "_ZN8TFT_eSPI7dmaWaitEv",         stub_tft_void },
+        /* Line drawing */
+        { "_ZN8TFT_eSPI8drawLineEiiiij",    stub_tft_drawLine },
+        /* Color conversion */
+        { "_ZN8TFT_eSPI8color565Ehhh",      stub_tft_color565 },
+        /* Rotation query */
+        { "_ZN8TFT_eSPI11getRotationEv",    stub_tft_getRotation },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, ds);
+            hooked++;
+        }
+    }
+
+    /* Look up fontdata[] symbol for built-in font rendering */
+    uint32_t fd_addr;
+    if (elf_symbols_find(syms, "_ZL8fontdata", &fd_addr) == 0)
+        ds->fontdata_addr = fd_addr;
+
+    /* Font 1 (GLCD) uses the global font[] array directly, NOT fontdata[1].chartbl.
+     * Look up the _ZL4font symbol separately for correct GLCD rendering. */
+    uint32_t glcd_addr;
+    if (elf_symbols_find(syms, "_ZL4font", &glcd_addr) == 0)
+        ds->glcd_font_addr = glcd_addr;
+
+    return hooked;
+}
+
+int display_stubs_hook_tft_esprite(display_stubs_t *ds, const elf_symbols_t *syms) {
+    if (!ds || !syms) return 0;
+
+    esp32_rom_stubs_t *rom = ds->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ds->rom = rom;
+
+    int hooked = 0;
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } hooks[] = {
+        /* Constructor / destructor */
+        { "_ZN11TFT_eSpriteC1EP8TFT_eSPI",   stub_sprite_ctor },
+        { "_ZN11TFT_eSpriteC2EP8TFT_eSPI",   stub_sprite_ctor },
+        { "_ZN11TFT_eSpriteD0Ev",             stub_sprite_dtor },
+        { "_ZN11TFT_eSpriteD1Ev",             stub_sprite_dtor },
+        { "_ZN11TFT_eSpriteD2Ev",             stub_sprite_dtor },
+        /* Sprite lifecycle */
+        { "_ZN11TFT_eSprite12createSpriteEssh", stub_sprite_createSprite },
+        { "_ZN11TFT_eSprite12deleteSpriteEv",   stub_sprite_deleteSprite },
+        { "_ZN11TFT_eSprite13setColorDepthEa",  stub_sprite_setColorDepth },
+        { "_ZN11TFT_eSprite13createPaletteEPKth", stub_sprite_noop_ret0 },
+        { "_ZN11TFT_eSprite12callocSpriteEssh",   stub_sprite_createSprite },
+        /* Drawing */
+        { "_ZN11TFT_eSprite10fillSpriteEj",      stub_sprite_fillSprite },
+        { "_ZN11TFT_eSprite8fillRectEiiiij",     stub_sprite_fillRect },
+        { "_ZN11TFT_eSprite9drawPixelEiij",      stub_sprite_drawPixel },
+        { "_ZN11TFT_eSprite13drawFastHLineEiiij", stub_sprite_drawFastHLine },
+        { "_ZN11TFT_eSprite13drawFastVLineEiiij", stub_sprite_drawFastVLine },
+        { "_ZN11TFT_eSprite8drawLineEiiiij",     stub_sprite_drawLine },
+        /* Image / blit */
+        { "_ZN11TFT_eSprite9pushImageEiiiiPKt",  stub_sprite_pushImage },
+        { "_ZN11TFT_eSprite9pushImageEiiiiPth",  stub_sprite_pushImage },
+        { "_ZN11TFT_eSprite10pushSpriteEii",     stub_sprite_pushSprite },
+        /* Window / cursor */
+        { "_ZN11TFT_eSprite9setWindowEiiii",     stub_sprite_setWindow },
+        { "_ZN11TFT_eSprite9pushColorEt",        stub_sprite_pushColor },
+        /* Text */
+        { "_ZN11TFT_eSprite8drawCharEtii",       stub_sprite_drawChar_3 },
+        { "_ZN11TFT_eSprite8drawCharEtiih",      stub_sprite_drawChar_4 },
+        { "_ZN11TFT_eSprite8drawCharEiitjjh",   stub_sprite_drawChar_6 },
+        { "_ZN11TFT_eSprite9drawGlyphEt",        stub_sprite_drawGlyph },
+        /* Queries */
+        { "_ZN11TFT_eSprite5widthEv",            stub_sprite_width },
+        { "_ZN11TFT_eSprite6heightEv",           stub_sprite_height },
+        { "_ZN11TFT_eSprite7createdEv",          stub_sprite_created },
+        { "_ZN11TFT_eSprite9readPixelEii",       stub_sprite_readPixel },
+        /* No-ops */
+        { "_ZN11TFT_eSprite15begin_nin_writeEv", stub_sprite_noop },
+        { "_ZN11TFT_eSprite13end_nin_writeEv",   stub_sprite_noop },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, ds);
+            hooked++;
+        }
+    }
+
+    return hooked;
+}
+
+int display_stubs_hook_ofr(display_stubs_t *ds, const elf_symbols_t *syms) {
+    if (!ds || !syms) return 0;
+
+    esp32_rom_stubs_t *rom = ds->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ds->rom = rom;
+
+    int hooked = 0;
+    struct {
+        const char *name;
+        rom_stub_fn fn;
+    } hooks[] = {
+        /* Text rendering */
+        { "_ZN14OpenFontRender10drawStringEPKciitt6Layout",  stub_ofr_drawString },
+        { "_ZN14OpenFontRender11cdrawStringEPKciitt6Layout", stub_ofr_cdrawString },
+        { "_ZN14OpenFontRender11rdrawStringEPKciitt6Layout", stub_ofr_rdrawString },
+        /* Font loading — return success (0) so firmware thinks font is ready */
+        { "_ZN14OpenFontRender8loadFontEPKhjh",   stub_ofr_ret0 },
+        { "_ZN14OpenFontRender8loadFontEN3OFR12LoadFontFromE", stub_ofr_ret0 },
+        /* setDrawer<TFT_eSprite> — no-op (we render directly, native code
+         * would try to set up std::function callbacks that we don't need) */
+        { "_ZN14OpenFontRender9setDrawerI11TFT_eSpriteEEvRT_", stub_ofr_void },
+        /* Metrics — return reasonable defaults */
+        { "_ZN14OpenFontRender16getFontMaxHeightEv",        stub_ofr_ret0 },
+        /* FreeType init — no-op success */
+        { "FT_Init_FreeType",                               stub_ofr_ret0 },
+        { "FT_Done_FreeType",                               stub_ofr_ret0 },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; hooks[i].name; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, hooks[i].name, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, hooks[i].fn, hooks[i].name, ds);
+            hooked++;
+        }
+    }
+
+    return hooked;
+}
+
+/* ===== LVGL (Light and Versatile Graphics Library) Support ===== */
+
+/* LVGL area structure (8 bytes) - same across all versions */
+typedef struct {
+    int16_t x1;  /* Left coordinate */
+    int16_t y1;  /* Top coordinate */
+    int16_t x2;  /* Right coordinate */
+    int16_t y2;  /* Bottom coordinate */
+} lv_area_t;
+
+/* LVGL uses RGB565 format (lv_color16_t when LV_COLOR_DEPTH=16),
+ * which matches our framebuffer format exactly. */
+
+/* LVGL 8.x/9.x: lv_display_flush_ready(lv_display_t *disp)
+ * LVGL 7.x: lv_disp_flush_ready(lv_disp_drv_t *disp_drv)
+ * Called by flush callback to signal completion. We're instant, so just return. */
+/* lv_disp_flush_ready is no longer hooked — firmware must run it to clear
+ * LVGL's internal flushing flags so rendering advances to the next strip. */
+
+/* Generic LVGL flush callback handler for versions 7.x, 8.x, 9.x
+ * Signature (all versions): void flush_cb(void *disp, const lv_area_t *area, lv_color_t *color_p)
+ *
+ * Parameters (Xtensa calling convention):
+ *   a2 (arg0) = this/disp pointer (varies by version, not needed)
+ *   a3 (arg1) = lv_area_t *area (pointer to rectangle bounds)
+ *   a4 (arg2) = lv_color_t *color_p (pointer to RGB565 pixel buffer)
+ *
+ * This intercepts user-defined flush callbacks and copies LVGL's framebuffer
+ * data to our emulator framebuffer.
+ */
+/* Spy-mode flush callback: copies LVGL pixel data to emulator framebuffer
+ * WITHOUT returning. The firmware's flush callback still executes normally
+ * (calling lv_disp_flush_ready to signal LVGL), because this is registered
+ * as a spy hook — it observes arguments, copies pixels, then the interpreter
+ * executes the original firmware function. */
+static void stub_lv_flush_cb_spy(xtensa_cpu_t *cpu, void *ctx) {
+    display_stubs_t *ds = ctx;
+
+    uint32_t drv_ptr = ds_arg(cpu, 0);
+    uint32_t area_ptr = ds_arg(cpu, 1);
+    uint32_t color_ptr = ds_arg(cpu, 2);
+
+    if (area_ptr && color_ptr) {
+        xtensa_mem_t *mem = cpu->mem;
+        int16_t x1 = (int16_t)mem_read16(mem, area_ptr + 0);
+        int16_t y1 = (int16_t)mem_read16(mem, area_ptr + 2);
+        int16_t x2 = (int16_t)mem_read16(mem, area_ptr + 4);
+        int16_t y2 = (int16_t)mem_read16(mem, area_ptr + 6);
+
+        if (x1 >= 0 && x2 >= x1 && x2 < ds->width &&
+            y1 >= 0 && y2 >= y1 && y2 < ds->height) {
+            if (ds->framebuf && ds->framebuf_mtx) {
+                pthread_mutex_lock(ds->framebuf_mtx);
+                uint32_t src_ptr = color_ptr;
+                for (int y = y1; y <= y2; y++) {
+                    for (int x = x1; x <= x2; x++) {
+                        ds->framebuf[y * ds->width + x] = mem_read16(mem, src_ptr);
+                        src_ptr += 2;
+                    }
+                }
+                pthread_mutex_unlock(ds->framebuf_mtx);
+            }
+
+            /* Emit a sandbox event with the same patch so the
+             * litegraph ILI9341 display node can render LVGL output
+             * the moment LVGL's flush callback fires — without waiting
+             * for esp_lcd_panel_draw_bitmap which LVGL bypasses. */
+            int w = (int)(x2 - x1 + 1);
+            int h = (int)(y2 - y1 + 1);
+            int npix = w * h;
+            if (npix > 0 && (size_t)npix * 2 <= sizeof(((sbx_event_t *)0)->lcd_pixels) + (320*240*2)) {
+                /* Copy into a static scratch so the event sink can read it
+                 * synchronously without holding the framebuf mutex. */
+                static uint8_t scratch[320 * 240 * 2];
+                if ((size_t)npix * 2 <= sizeof(scratch)) {
+                    uint32_t src_ptr = color_ptr;
+                    for (int i = 0; i < npix; i++) {
+                        scratch[2*i + 0] = mem_read8(mem, src_ptr++);
+                        scratch[2*i + 1] = mem_read8(mem, src_ptr++);
+                    }
+                    sbx_event_t ev = { .kind = SBX_EV_LCD_PIXELS, .cycle = 0 };
+                    ev.lcd_pixels.x = (uint32_t)x1;
+                    ev.lcd_pixels.y = (uint32_t)y1;
+                    ev.lcd_pixels.w = (uint32_t)w;
+                    ev.lcd_pixels.h = (uint32_t)h;
+                    ev.lcd_pixels.bpp = 16;
+                    ev.lcd_pixels.pixels = scratch;
+                    sbx_events_emit(&ev);
+                }
+            }
+        }
+
+        /* Clear LVGL's flushing flags (replaces lv_disp_flush_ready).
+         * draw_buf at drv+12, flushing at draw_buf+16, flushing_last at +20. */
+        uint32_t draw_buf_ptr = mem_read32(mem, drv_ptr + 12);
+        if (draw_buf_ptr) {
+            mem_write32(mem, draw_buf_ptr + 16, 0);
+            mem_write32(mem, draw_buf_ptr + 20, 0);
+        }
+    }
+
+    ds_return_void(cpu);
+}
+
+/* Context for flush callback symbol scanner */
+struct flush_scan_ctx {
+    display_stubs_t *ds;
+    esp32_rom_stubs_t *rom;
+    int hooked;
+};
+
+/* Iterator callback: checks if symbol name matches flush callback patterns */
+static int scan_for_flush_callback(const char *name, uint32_t addr, uint32_t size, void *ctx) {
+    (void)size;  /* unused */
+    struct flush_scan_ctx *scan_ctx = ctx;
+
+    /* Skip LVGL internal functions — we want to hook user flush callbacks,
+     * not LVGL's internal dispatcher or state management functions. The
+     * `*_flush` pattern was historically too broad (matched things like
+     * `draw_buf_flush` in lv_draw_buf.c), so we now require either the
+     * explicit `_flush_cb` / `_flush_callback` suffix or the function to
+     * be the canonical esp_lvgl_port helper.
+     *
+     * Also skip esp_lvgl_port's helper: it just calls
+     * esp_lcd_panel_draw_bitmap which we hook directly with proper
+     * panel-type detection (ILI9341 / SSD1306 / etc.). Letting it
+     * pass through gives us the correct bit depth automatically. */
+    if (strcmp(name, "call_flush_cb") == 0 ||
+        strcmp(name, "draw_buf_flush") == 0 ||
+        strcmp(name, "lvgl_port_flush_callback") == 0 ||
+        strncmp(name, "lv_refr_", 8) == 0 ||
+        strncmp(name, "lv_draw_", 8) == 0 ||
+        strstr(name, "flush_ready") != NULL ||
+        strncmp(name, "lv_disp_", 8) == 0 ||
+        strncmp(name, "lv_display_", 11) == 0) {
+        return 0;  /* skip */
+    }
+
+    /* Pattern 1: ends with "_flush_cb" or "_flush_callback" */
+    size_t len = strlen(name);
+    if (len > 9 && strcmp(name + len - 9, "_flush_cb") == 0) {
+        rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_spy, name, scan_ctx->ds);
+        scan_ctx->hooked++;
+        return 0;
+    }
+    if (len > 15 && strcmp(name + len - 15, "_flush_callback") == 0) {
+        rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_spy, name, scan_ctx->ds);
+        scan_ctx->hooked++;
+        return 0;
+    }
+
+    /* Pattern 2: contains "flush" (but not ROM functions like esp_rom_crc32_le) */
+    if (strstr(name, "flush") != NULL && strstr(name, "rom") == NULL) {
+        /* Be more selective - only hook if it looks like a display flush:
+         * must also contain "disp", "lcd", "tft", "lvgl", or "lv_" */
+        if (strstr(name, "disp") != NULL ||
+            strstr(name, "lcd") != NULL ||
+            strstr(name, "tft") != NULL ||
+            strstr(name, "lvgl") != NULL ||
+            strstr(name, "lv_") != NULL ||
+            strstr(name, "display") != NULL) {
+            rom_stubs_register_ctx(scan_ctx->rom, addr, stub_lv_flush_cb_spy, name, scan_ctx->ds);
+            scan_ctx->hooked++;
+        }
+    }
+
+    return 0;  /* continue scanning */
+}
+
+int display_stubs_hook_lvgl(display_stubs_t *ds, const elf_symbols_t *syms) {
+    if (!ds || !syms) return 0;
+
+    esp32_rom_stubs_t *rom = ds->cpu->pc_hook_ctx;
+    if (!rom) return 0;
+    ds->rom = rom;
+
+    int hooked = 0;
+
+    /* Do NOT hook lv_disp_flush_ready / lv_display_flush_ready.
+     * These clear LVGL's internal flushing flags — if we intercept them,
+     * LVGL thinks the flush is still in progress and never advances to
+     * the next screen region. Let the firmware handle flush_ready. */
+
+    /* Hook common user-defined flush callback names.
+     * These vary by project, so we scan for patterns. */
+    struct {
+        const char *pattern;
+        rom_stub_fn fn;
+    } flush_patterns[] = {
+        /* Common patterns in ESP32/LVGL projects */
+        { "my_disp_flush",          stub_lv_flush_cb_spy },
+        { "disp_flush",             stub_lv_flush_cb_spy },
+        { "tft_flush",              stub_lv_flush_cb_spy },
+        { "lcd_flush",              stub_lv_flush_cb_spy },
+        { "display_flush_cb",       stub_lv_flush_cb_spy },
+        { "lvgl_flush_cb",          stub_lv_flush_cb_spy },
+        { "lv_flush_cb",            stub_lv_flush_cb_spy },
+        /* Marauder-specific (if it uses LVGL) */
+        { "marauder_disp_flush",    stub_lv_flush_cb_spy },
+        { NULL, NULL }
+    };
+
+    for (int i = 0; flush_patterns[i].pattern; i++) {
+        uint32_t addr;
+        if (elf_symbols_find(syms, flush_patterns[i].pattern, &addr) == 0) {
+            rom_stubs_register_ctx(rom, addr, flush_patterns[i].fn,
+                                   flush_patterns[i].pattern, ds);
+            hooked++;
+        }
+    }
+
+    /* Wildcard symbol scanning for flush callbacks (Task #23).
+     * Scans all symbols for patterns like *_flush*, *flush_cb*, *disp_flush*
+     * to catch user-defined callbacks regardless of naming convention. */
+    struct flush_scan_ctx scan_ctx = { ds, rom, 0 };
+    elf_symbols_iterate(syms, scan_for_flush_callback, &scan_ctx);
+    hooked += scan_ctx.hooked;
+
+    return hooked;
+}

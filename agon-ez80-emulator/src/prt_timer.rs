@@ -1,0 +1,256 @@
+// ez80f92 programmable reload timer
+
+/** Many bothans died to determine this value. */
+const PRT_INT_LATENCY: u8 = 5;
+
+#[derive(Debug)]
+pub struct PrtTimer {
+    // bit 0 - PRT_EN (enable)
+    //     1 - RST_EN (reload & restart enabled)
+    //     2-3 - CLK_DIV (4, 16, 64, 256)
+    //     4 - PRT_MODE (0 - single pass, 1 - continuous)
+    //     5 - n/a
+    //     6 - IRQ_EN (irq enabled)
+    //     7 - PRT_IRQ
+    ctl: u8,
+    reload: u16,
+    counter: u16,
+    step_: u16,
+    latch_counter_high: u8,
+    interrupt_due_in: u8,
+    //t_: std::time::Instant
+}
+
+const PRT_EN: u8 = 0x1;
+const RST_EN: u8 = 0x2;
+const PRT_MODE: u8 = 0x10;
+
+impl PrtTimer {
+    pub fn new() -> Self {
+        PrtTimer {
+            ctl: 0,
+            reload: 0,
+            counter: 0,
+            step_: 0,
+            latch_counter_high: 0,
+            interrupt_due_in: 0,
+            //t_: std::time::Instant::now()
+        }
+    }
+
+    pub fn irq_due(&self) -> bool {
+        (self.ctl & 0xc0) == 0xc0
+    }
+
+    pub fn write_ctl(&mut self, c: u8) {
+        self.ctl = c;
+    }
+
+    pub fn read_ctl(&mut self) -> u8 {
+        let c = self.ctl;
+        self.ctl &= 0x7f; // clear bit 7 (PRT_IRQ)
+        c
+    }
+
+    pub fn read_counter_low(&mut self) -> u8 {
+        self.latch_counter_high = (self.counter >> 8) as u8;
+        (self.counter & 0xff) as u8
+    }
+
+    pub fn read_counter_high(&mut self) -> u8 {
+        self.latch_counter_high
+    }
+
+    pub fn write_reload_low(&mut self, rl: u8) {
+        self.reload = (self.reload & 0xff00) | (rl as u16);
+    }
+
+    pub fn write_reload_high(&mut self, rh: u8) {
+        self.reload = (self.reload & 0xff) | ((rh as u16) << 8);
+    }
+
+    fn clk_div(&self) -> u16 {
+        match (self.ctl >> 2) & 3 {
+            0 => 4,
+            1 => 16,
+            2 => 64,
+            3 => 256,
+            _ => panic!(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool { self.ctl & PRT_EN != 0 }
+
+    fn advance_irq_latency(&mut self, clock_ticks: u16) {
+        if self.interrupt_due_in != 0 {
+            if clock_ticks as u8 >= self.interrupt_due_in {
+                self.ctl |= 0x80;
+                self.interrupt_due_in = 0;
+            } else {
+                self.interrupt_due_in -= clock_ticks as u8;
+            }
+        }
+    }
+
+    fn prepare_count(&mut self) -> bool {
+        if !self.enabled() { return false; }
+        if self.ctl & RST_EN != 0 {
+            self.counter = self.reload;
+            self.step_ = 0;
+            self.ctl &= !RST_EN;
+        }
+        true
+    }
+
+    fn count_one(&mut self) -> bool {
+        self.counter = self.counter.wrapping_sub(1);
+        if self.counter == 0 {
+            if self.interrupt_due_in == 0 {
+                self.interrupt_due_in = PRT_INT_LATENCY;
+            }
+            if self.ctl & PRT_MODE == 0 {
+                self.ctl &= 0b1111_1100;
+                return false;
+            }
+            self.counter = self.reload;
+        }
+        true
+    }
+
+    // Original system-clock path, retaining divider and IRQ behavior.
+    pub fn apply_ticks(&mut self, clock_ticks: u16) {
+        self.advance_irq_latency(clock_ticks);
+        if !self.prepare_count() { return; }
+        let clk_div = self.clk_div();
+        self.step_ = self.step_.wrapping_add(clock_ticks);
+        while self.step_ >= clk_div {
+            self.step_ -= clk_div;
+            if !self.count_one() { break; }
+        }
+    }
+
+    // RTC / pin sources bypass the PRT divider (PS015317 pp80,85–87).
+    // IRQ-latch latency still advances in system clocks, even without events.
+    pub fn apply_events(&mut self, clock_ticks: u16, events: u64) {
+        self.advance_irq_latency(clock_ticks);
+        if !self.prepare_count() { return; }
+        for _ in 0..events {
+            if !self.count_one() { break; }
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prt_timer::PRT_INT_LATENCY;
+
+    use super::PrtTimer;
+
+    #[test]
+    fn test_timer_single_pass() {
+        let mut timer = PrtTimer::new();
+        timer.write_reload_low(2);
+        timer.apply_ticks(4);
+        // not enabled yet
+        assert_eq!(timer.counter, 0);
+
+        timer.write_ctl(3);
+        assert_eq!(timer.counter, 0);
+        timer.apply_ticks(3);
+        assert_eq!(timer.counter, 2);
+        timer.apply_ticks(1);
+        assert_eq!(timer.counter, 1);
+        timer.apply_ticks(0);
+        assert_eq!(timer.counter, 1);
+        timer.apply_ticks(4);
+        assert_eq!(timer.counter, 0);
+        // not in continuous mode
+        timer.apply_ticks(4);
+        assert_eq!(timer.counter, 0);
+        assert_eq!(timer.read_ctl(), 0x00);
+        timer.apply_ticks(PRT_INT_LATENCY as u16);
+        // first read (after IRQ latency period) - PRT_IRQ set
+        assert_eq!(timer.read_ctl(), 0x80);
+        // second read - PRT_IRQ has been cleared
+        assert_eq!(timer.read_ctl(), 0x0);
+    }
+
+    #[test]
+    fn test_timer_single_pass_65536() {
+        // try with 65536 timer duration
+        let mut timer = PrtTimer::new();
+        // enable
+        timer.write_ctl(3);
+        assert_eq!(timer.counter, 0);
+        for _i in 0..65535 {
+            timer.apply_ticks(4);
+        }
+        assert_eq!(timer.counter, 1);
+        timer.apply_ticks(4);
+        assert_eq!(timer.counter, 0);
+        timer.apply_ticks(4);
+        assert_eq!(timer.counter, 0);
+    }
+
+    #[test]
+    fn test_timer_continuous() {
+        let mut timer = PrtTimer::new();
+        timer.write_reload_low(2);
+        timer.apply_ticks(4);
+        // not enabled yet
+        assert_eq!(timer.counter, 0);
+
+        timer.write_ctl(3 | 0x10);
+        assert_eq!(timer.counter, 0);
+        timer.apply_ticks(3);
+        assert_eq!(timer.counter, 2);
+        timer.apply_ticks(1);
+        assert_eq!(timer.counter, 1);
+        timer.apply_ticks(0);
+        assert_eq!(timer.counter, 1);
+        timer.apply_ticks(4);
+        // in continuous mode, timer counter never goes to zero: it resets to reload value instead
+        assert_eq!(timer.counter, 2);
+        timer.apply_ticks(4);
+        assert_eq!(timer.counter, 1);
+        assert_eq!(timer.read_ctl(), 0x11);
+        timer.apply_ticks(PRT_INT_LATENCY as u16); // take into account interrupt latency
+                                                   // first read - PRT_IRQ set
+        assert_eq!(timer.read_ctl(), 0x91);
+        // second read - PRT_IRQ has been cleared
+        assert_eq!(timer.read_ctl(), 0x11);
+    }
+
+    #[test]
+    fn test_timer_continuous_65536() {
+        // try with 65536 timer duration
+        let mut timer = PrtTimer::new();
+        // enable
+        timer.write_ctl(3 | 0x10);
+        assert_eq!(timer.counter, 0);
+        for _i in 0..65535 {
+            timer.apply_ticks(4);
+        }
+        // no interrupt yet
+        assert_eq!(timer.read_ctl(), 0x11);
+        assert_eq!(timer.counter, 1);
+        timer.apply_ticks(4);
+        assert_eq!(timer.counter, 0);
+        // PRT_IRQ not set until 4 more cycles (latency)
+        timer.apply_ticks(PRT_INT_LATENCY as u16);
+        // first read - PRT_IRQ set
+        assert_eq!(timer.read_ctl(), 0x91);
+        // second read - PRT_IRQ has been cleared
+        assert_eq!(timer.read_ctl(), 0x11);
+        assert_eq!(timer.counter, 65535);
+    }
+
+    #[test]
+    fn test_write_reload() {
+        let mut timer = PrtTimer::new();
+        timer.write_reload_low(0xfe);
+        timer.write_reload_high(0xca);
+        assert_eq!(timer.reload, 0xcafe);
+    }
+}

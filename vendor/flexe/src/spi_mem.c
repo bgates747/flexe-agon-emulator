@@ -1,0 +1,1272 @@
+#include "spi_mem.h"
+#include "target.h"
+
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define SPI_MEM_REGISTER_WORDS 64u
+#define SPI_MEM_BUFFER_WORDS   16u
+
+/* GD25Q32C SFDP, GigaDevice DS-00088 rev 4.1, tables 3-5. The GD25Q64C
+ * (DS-00111 rev 3.2, tables 3-5) has the same bytes in this range except
+ * for the density at 0x37. Select profiles by both JEDEC ID and physical
+ * capacity; other virtual NOR sizes must not inherit either table.
+ * Unlisted addresses in the serial parameter space read as pulled-up 0xFF. */
+static const uint8_t GD25Q32C_SFDP[] = {
+    0x53, 0x46, 0x44, 0x50, 0x00, 0x01, 0x01, 0xFF,
+    0x00, 0x00, 0x01, 0x09, 0x30, 0x00, 0x00, 0xFF,
+    0xC8, 0x00, 0x01, 0x03, 0x60, 0x00, 0x00, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xE5, 0x20, 0xF1, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+    0x44, 0xEB, 0x08, 0x6B, 0x08, 0x3B, 0x42, 0xBB,
+    0xEE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF,
+    0xFF, 0xFF, 0x00, 0xFF, 0x0C, 0x20, 0x0F, 0x52,
+    0x10, 0xD8, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x00, 0x36, 0x00, 0x27, 0x9E, 0xF9, 0x77, 0x64,
+    0xFC, 0xEB, 0xFF, 0xFF,
+};
+
+/* CMD bits shared by the ESP32 and S2/S3 SPI-memory generations. */
+#define SPI_CMD_FLASH_PE       (1u << 17)
+#define SPI_CMD_USR            (1u << 18)
+#define SPI_CMD_FLASH_HPM      (1u << 19)
+#define SPI_CMD_FLASH_RES      (1u << 20)
+#define SPI_CMD_FLASH_DP       (1u << 21)
+#define SPI_CMD_FLASH_CE       (1u << 22)
+#define SPI_CMD_FLASH_BE       (1u << 23)
+#define SPI_CMD_FLASH_SE       (1u << 24)
+#define SPI_CMD_FLASH_PP       (1u << 25)
+#define SPI_CMD_FLASH_WRSR     (1u << 26)
+#define SPI_CMD_FLASH_RDSR     (1u << 27)
+#define SPI_CMD_FLASH_RDID     (1u << 28)
+#define SPI_CMD_FLASH_WRDI     (1u << 29)
+#define SPI_CMD_FLASH_WREN     (1u << 30)
+#define SPI_CMD_FLASH_READ     (1u << 31)
+
+#define SPI_USER_MISO_HIGHPART (1u << 24)
+#define SPI_USER_MOSI_HIGHPART (1u << 25)
+#define SPI_USER_MOSI          (1u << 27)
+#define SPI_USER_MISO          (1u << 28)
+#define SPI_USER_ADDR          (1u << 30)
+#define SPI_USER_COMMAND       (1u << 31)
+
+#define FLASH_SR_WIP           (1u << 0)
+#define FLASH_SR_WEL           (1u << 1)
+
+typedef struct {
+    uint16_t status_offset;
+    uint16_t user_offset;
+    uint16_t user1_offset;
+    uint16_t user2_offset;
+    uint16_t mosi_dlen_offset;
+    uint16_t miso_dlen_offset;
+    uint16_t chip_select_offset;
+    uint16_t fsm_offset;
+    uint16_t buffer_offset;
+    uint16_t date_offset;
+    uint32_t dlen_mask;
+    uint32_t user_reset;
+    uint32_t user1_reset;
+    uint32_t user2_reset;
+    uint32_t chip_select_reset;
+    uint8_t chip_select_count;
+    bool packed_program_length;
+    bool date_writable;
+} spi_mem_layout_desc_t;
+
+typedef struct {
+    /* The complete low 256-byte register aperture is small enough to retain
+     * directly. Reads and writes are still admitted only for documented
+     * offsets, so reserved accesses remain visible to diagnostics. */
+    uint32_t reg[SPI_MEM_REGISTER_WORDS];
+    uint32_t date;
+} spi_mem_host_t;
+
+/* SPI0 and SPI1 are two controllers in front of the same physical flash and
+ * PSRAM buses. Device state therefore lives here, not in either controller's
+ * register file. A write-enable issued through one host is visible to the
+ * other host just as it is on the SoC. */
+typedef flexe_spi_mem_nor_state_t spi_nor_state_t;
+
+typedef flexe_spi_mem_psram_state_t spi_psram_state_t;
+
+typedef struct {
+    uint16_t opcode;
+    uint8_t opcode_bits;
+    uint32_t address;
+    const uint8_t *mosi;
+    int mosi_bytes;
+    int miso_bytes;
+    bool opcode_valid;
+} spi_mem_transaction_t;
+
+struct flexe_spi_mem {
+    xtensa_mem_t *mem;
+    const flexe_target_desc_t *target;
+    const spi_mem_layout_desc_t *layout;
+    mmio_read_fn fallback_read;
+    mmio_write_fn fallback_write;
+    void *fallback_ctx;
+    flexe_spi_mem_flash_changed_fn flash_changed;
+    void *flash_changed_ctx;
+    spi_mem_host_t host[FLEXE_TARGET_SPI_MEM_HOST_MAX];
+    spi_nor_state_t flash;
+    spi_psram_state_t psram;
+};
+
+static const spi_mem_layout_desc_t SPI_MEM_LAYOUT_ESP32 = {
+    .status_offset = 0x010u,
+    .user_offset = 0x01Cu,
+    .user1_offset = 0x020u,
+    .user2_offset = 0x024u,
+    .mosi_dlen_offset = 0x028u,
+    .miso_dlen_offset = 0x02Cu,
+    .chip_select_offset = 0x034u, /* PIN */
+    .fsm_offset = 0x0F8u, /* EXT2.ST */
+    .buffer_offset = 0x080u,
+    .date_offset = 0x3FCu,
+    .dlen_mask = 0x00FFFFFFu,
+    .user_reset = 0x80000040u,
+    .user1_reset = 0x5C000007u,
+    .user2_reset = 0x70000000u,
+    /* CS0 enabled; CS1 and CS2 disabled. */
+    .chip_select_reset = 0x00000006u,
+    .chip_select_count = 3u,
+    .packed_program_length = true,
+};
+
+static const spi_mem_layout_desc_t SPI_MEM_LAYOUT_S2_S3 = {
+    .status_offset = 0x02Cu,
+    .user_offset = 0x018u,
+    .user1_offset = 0x01Cu,
+    .user2_offset = 0x020u,
+    .mosi_dlen_offset = 0x024u,
+    .miso_dlen_offset = 0x028u,
+    .chip_select_offset = 0x034u, /* MISC */
+    .fsm_offset = 0x054u,
+    .buffer_offset = 0x058u,
+    .date_offset = 0x3FCu,
+    .dlen_mask = 0x000003FFu,
+    .user_reset = 0x80000000u,
+    .user1_reset = 0x5C000007u,
+    .user2_reset = 0x70000000u,
+    /* CS0 enabled; CS1 disabled. */
+    .chip_select_reset = 0x00000002u,
+    .chip_select_count = 2u,
+    .date_writable = true,
+};
+
+static const spi_mem_layout_desc_t *spi_mem_layout(
+        flexe_spi_mem_layout_t layout) {
+    switch (layout) {
+    case FLEXE_SPI_MEM_LAYOUT_ESP32: return &SPI_MEM_LAYOUT_ESP32;
+    case FLEXE_SPI_MEM_LAYOUT_S2_S3: return &SPI_MEM_LAYOUT_S2_S3;
+    default: return NULL;
+    }
+}
+
+static bool spi_mem_geometry_valid(const flexe_target_desc_t *target,
+                                   const spi_mem_layout_desc_t *layout) {
+    if (!target || !layout ||
+        !(target->capabilities & FLEXE_TARGET_CAP_SPI_MEM))
+        return false;
+    const flexe_spi_mem_desc_t *desc = &target->spi_mem;
+    if (desc->host_count == 0u ||
+        desc->host_count > FLEXE_TARGET_SPI_MEM_HOST_MAX ||
+        desc->register_size < layout->date_offset + sizeof(uint32_t) ||
+        (desc->register_size & 0xFFFu) != 0u ||
+        desc->default_jedec_id == 0u ||
+        desc->default_jedec_id > 0x00FFFFFFu ||
+        desc->maximum_flash_size == 0u ||
+        (desc->maximum_flash_size & (desc->maximum_flash_size - 1u)) != 0u ||
+        desc->maximum_flash_size <
+            target->backing_size[FLEXE_MEM_FLASH_DATA] ||
+        desc->maximum_flash_size <
+            target->backing_size[FLEXE_MEM_FLASH_INSN] ||
+        desc->flash_chip_select >= layout->chip_select_count)
+        return false;
+    bool has_psram = desc->psram_kind != FLEXE_SPI_MEM_PSRAM_NONE;
+    if ((has_psram &&
+         (desc->psram_chip_select >= layout->chip_select_count ||
+          desc->psram_chip_select == desc->flash_chip_select ||
+          target->backing_size[FLEXE_MEM_PSRAM] == 0u)) ||
+        (!has_psram && (desc->psram_chip_select != FLEXE_SPI_MEM_CS_NONE ||
+                        desc->default_psram_id != 0u ||
+                        target->backing_size[FLEXE_MEM_PSRAM] != 0u)))
+        return false;
+    if ((desc->psram_kind == FLEXE_SPI_MEM_PSRAM_QUAD &&
+         desc->default_psram_id == 0u) ||
+        (desc->psram_kind == FLEXE_SPI_MEM_PSRAM_AP_8M_OPI &&
+         (desc->layout != FLEXE_SPI_MEM_LAYOUT_S2_S3 ||
+          desc->default_psram_id != 0u ||
+          target->backing_size[FLEXE_MEM_PSRAM] != 0x800000u)) ||
+        desc->psram_kind > FLEXE_SPI_MEM_PSRAM_AP_8M_OPI)
+        return false;
+    for (unsigned host = 0; host < desc->host_count; host++) {
+        uint32_t base = desc->base[host];
+        if ((base & 0xFFFu) != 0u || base < target->peripheral_start ||
+            base >= target->peripheral_end ||
+            desc->register_size > target->peripheral_end - base)
+            return false;
+        for (unsigned other = 0; other < host; other++) {
+            uint32_t other_base = desc->base[other];
+            if (base < other_base + desc->register_size &&
+                other_base < base + desc->register_size)
+                return false;
+        }
+    }
+    return target->backing_size[FLEXE_MEM_FLASH_DATA] != 0u &&
+           target->backing_size[FLEXE_MEM_FLASH_INSN] != 0u;
+}
+
+static int spi_mem_host_index(const flexe_spi_mem_t *spi_mem,
+                              uint32_t addr) {
+    const flexe_spi_mem_desc_t *desc = &spi_mem->target->spi_mem;
+    for (unsigned host = 0; host < desc->host_count; host++)
+        if (addr >= desc->base[host] &&
+            addr - desc->base[host] < desc->register_size)
+            return (int)host;
+    return -1;
+}
+
+static bool spi_mem_known_offset(flexe_spi_mem_layout_t generation,
+                                 uint32_t offset) {
+    offset &= ~3u;
+    switch (generation) {
+    case FLEXE_SPI_MEM_LAYOUT_ESP32:
+        return offset <= 0x064u ||
+               (offset >= 0x080u && offset <= 0x0C0u) ||
+               (offset >= 0x0F0u && offset <= 0x0FCu) ||
+               offset == 0x3FCu;
+    case FLEXE_SPI_MEM_LAYOUT_S2_S3:
+        return offset <= 0x0B4u ||
+               (offset >= 0x0BCu && offset <= 0x0D4u) ||
+               (offset >= 0x0DCu && offset <= 0x0FCu) ||
+               offset == 0x3FCu;
+    default:
+        return false;
+    }
+}
+
+static uint32_t spi_mem_flash_size(const flexe_spi_mem_t *spi_mem) {
+    return mem_flash_physical_size(spi_mem->mem);
+}
+
+static bool spi_mem_is_gd25q32c(const flexe_spi_mem_t *spi_mem) {
+    return mem_flash_jedec_id(spi_mem->mem) == 0x001640C8u &&
+           spi_mem_flash_size(spi_mem) == 0x00400000u;
+}
+
+static bool spi_mem_is_gd25q64c(const flexe_spi_mem_t *spi_mem) {
+    return mem_flash_jedec_id(spi_mem->mem) == 0x001740C8u &&
+           spi_mem_flash_size(spi_mem) == 0x00800000u;
+}
+
+typedef enum {
+    SPI_MEM_WRITE_ALLOWED,
+    SPI_MEM_WRITE_PROTECTED,
+    SPI_MEM_WRITE_UNSUPPORTED,
+} spi_mem_write_result_t;
+
+/* GD25Q32C DS-00088 rev 4.1, Tables 1.0/1.1. BP2..0 select a
+ * top/bottom fraction, BP3 chooses bottom, BP4 switches to 4 KiB units,
+ * and CMP complements the selected region. All boundaries are sector
+ * aligned, so an overlapping erase or page program is rejected whole. */
+static spi_mem_write_result_t spi_mem_write_gate(
+        const flexe_spi_mem_t *spi_mem, uint32_t offset, uint32_t bytes) {
+    const spi_nor_state_t *flash = &spi_mem->flash;
+    if (!spi_mem_is_gd25q32c(spi_mem)) {
+        /* Another JEDEC capacity is not necessarily the same silicon with
+         * the same protection layout. Keep that path diagnostic. */
+        return ((flash->status[0] & 0x7Cu) != 0u ||
+                (flash->status[1] & 0x40u) != 0u) ?
+            SPI_MEM_WRITE_UNSUPPORTED : SPI_MEM_WRITE_ALLOWED;
+    }
+
+    uint32_t bp = (flash->status[0] >> 2) & 0x1Fu;
+    uint32_t group = bp & 7u;
+    bool cmp = (flash->status[1] & 0x40u) != 0u;
+    uint32_t flash_size = spi_mem_flash_size(spi_mem);
+    uint32_t start = 0u, end = 0u;
+    if (group == 0u || group == 7u) {
+        if ((group == 0u && cmp) || (group == 7u && !cmp))
+            end = flash_size;
+    } else {
+        uint32_t length = (bp & 0x10u) ?
+            0x1000u << (group > 4u ? 3u : group - 1u) :
+            0x10000u << (group - 1u);
+        bool bottom = (bp & 0x08u) != 0u;
+        if (cmp) {
+            start = bottom ? length : 0u;
+            end = bottom ? flash_size : flash_size - length;
+        } else {
+            start = bottom ? 0u : flash_size - length;
+            end = bottom ? length : flash_size;
+        }
+    }
+    return bytes > 0u && offset < end && start < offset + bytes ?
+        SPI_MEM_WRITE_PROTECTED : SPI_MEM_WRITE_ALLOWED;
+}
+
+static void spi_mem_nor_clear_volatile(flexe_spi_mem_t *spi_mem) {
+    spi_nor_state_t *flash = &spi_mem->flash;
+    flash->status[0] &= (uint8_t)~(FLASH_SR_WIP | FLASH_SR_WEL);
+    if (spi_mem_is_gd25q32c(spi_mem)) {
+        /* GD25Q32C: SR2.SUS1/SUS2 and SR3.HPF are volatile. The retained
+         * bits are SRP0/BP4..0, CMP/LB3..1/QE/SRP1 and DRV1/DRV0. */
+        flash->status[1] &= 0x7Bu;
+        flash->status[2] &= 0x60u;
+    }
+    flash->powered_down = false;
+    flash->address_4byte = false;
+    flash->reset_armed = false;
+}
+
+static uint32_t *spi_mem_buffer(flexe_spi_mem_t *spi_mem,
+                                spi_mem_host_t *host, bool input) {
+    uint32_t *buffer = &host->reg[spi_mem->layout->buffer_offset / 4u];
+    uint32_t user = host->reg[spi_mem->layout->user_offset / 4u];
+    uint32_t highpart = input ? SPI_USER_MISO_HIGHPART :
+                                SPI_USER_MOSI_HIGHPART;
+    return buffer + ((user & highpart) ? 8u : 0u);
+}
+
+static int spi_mem_data_bytes(const flexe_spi_mem_t *spi_mem,
+                              uint32_t dlen, const spi_mem_host_t *host,
+                              bool input) {
+    uint32_t user = host->reg[spi_mem->layout->user_offset / 4u];
+    uint32_t highpart = input ? SPI_USER_MISO_HIGHPART :
+                                SPI_USER_MOSI_HIGHPART;
+    uint32_t max_bytes = (user & highpart) ? 32u : 64u;
+    uint32_t bits = (dlen & spi_mem->layout->dlen_mask) + 1u;
+    uint32_t bytes = (bits + 7u) / 8u;
+    return (int)(bytes > max_bytes ? max_bytes : bytes);
+}
+
+/* SPI_ADDR holds the address phase left-aligned. Convert the low `keep_bits`
+ * of that phase to an integer after optionally consuming a command byte from
+ * its front. Mode bits which make a phase non-byte-aligned remain excluded,
+ * matching the controller's DIO/QIO address packing. */
+static uint32_t spi_mem_address_tail(uint32_t value, unsigned phase_bits,
+                                     unsigned consumed_bits) {
+    if (phase_bits > 32u || consumed_bits > phase_bits) return 0u;
+    unsigned keep_bits = (phase_bits - consumed_bits) & ~7u;
+    if (keep_bits == 0u) return 0u;
+    unsigned shift = 32u - consumed_bits - keep_bits;
+    uint32_t phase = shift == 0u ? value : value >> shift;
+    if (keep_bits >= 32u) return phase;
+    return phase & ((UINT32_C(1) << keep_bits) - 1u);
+}
+
+static uint32_t spi_mem_command_address(const flexe_spi_mem_t *spi_mem,
+                                         uint32_t value,
+                                         unsigned phase_bits) {
+    if (phase_bits > 32u) return 0u;
+    if (spi_mem->target->spi_mem.layout == FLEXE_SPI_MEM_LAYOUT_S2_S3) {
+        /* SPI_MEM_ADDR on S2/S3 stores a 24-bit flash address in bits
+         * 23:0 (or the whole word in 4-byte address mode). Unlike the
+         * original ESP32 controller, firmware does not left-align a
+         * 24-bit phase before writing the register. */
+        unsigned keep_bits = phase_bits & ~7u;
+        if (keep_bits == 0u) return 0u;
+        if (keep_bits == 32u) return value;
+        return value & ((UINT32_C(1) << keep_bits) - 1u);
+    }
+    return spi_mem_address_tail(value, phase_bits, 0u);
+}
+
+static int spi_mem_program_bytes(const flexe_spi_mem_t *spi_mem,
+                                 const spi_mem_host_t *host) {
+    uint32_t addr = host->reg[1];
+    int bytes = spi_mem->layout->packed_program_length ?
+                (int)(addr >> 24) : 0;
+    if (bytes == 0)
+        bytes = spi_mem_data_bytes(
+            spi_mem,
+            host->reg[spi_mem->layout->mosi_dlen_offset / 4u],
+            host, false);
+    return bytes > 64 ? 64 : bytes;
+}
+
+static spi_mem_transaction_t spi_mem_decode_user(
+        flexe_spi_mem_t *spi_mem, spi_mem_host_t *host) {
+    spi_mem_transaction_t transaction = {0};
+    uint32_t user = host->reg[spi_mem->layout->user_offset / 4u];
+    uint32_t user1 = host->reg[spi_mem->layout->user1_offset / 4u];
+    uint32_t user2 = host->reg[spi_mem->layout->user2_offset / 4u];
+    uint32_t address = host->reg[1];
+
+    transaction.mosi = (const uint8_t *)spi_mem_buffer(
+        spi_mem, host, false);
+    if (user & SPI_USER_MOSI)
+        transaction.mosi_bytes = spi_mem_data_bytes(
+            spi_mem,
+            host->reg[spi_mem->layout->mosi_dlen_offset / 4u],
+            host, false);
+    if (user & SPI_USER_MISO)
+        transaction.miso_bytes = spi_mem_data_bytes(
+            spi_mem,
+            host->reg[spi_mem->layout->miso_dlen_offset / 4u],
+            host, true);
+
+    unsigned address_bits = 0u;
+    if (user & SPI_USER_ADDR)
+        address_bits = ((user1 >> 26) & 0x3Fu) + 1u;
+
+    if (user & SPI_USER_COMMAND) {
+        unsigned command_bits = ((user2 >> 28) & 0xFu) + 1u;
+        if (command_bits == 8u) {
+            transaction.opcode = (uint8_t)user2;
+            transaction.opcode_bits = 8u;
+            transaction.opcode_valid = true;
+            transaction.address = spi_mem_command_address(
+                spi_mem, address, address_bits);
+            return transaction;
+        }
+        if (command_bits == 16u) {
+            transaction.opcode = (uint16_t)user2;
+            transaction.opcode_bits = 16u;
+            transaction.opcode_valid = true;
+            transaction.address = spi_mem_command_address(
+                spi_mem, address, address_bits);
+            return transaction;
+        }
+
+        /* ESP32's original 32-Mbit PSRAM needs two idle clocks before some
+         * commands. ESP-IDF expresses those clocks as a short all-zero
+         * command phase and carries the actual opcode in the first byte of
+         * the address phase. Decode the wire phases, not a particular PC or
+         * firmware build. */
+        uint32_t command_mask = (UINT32_C(1) << command_bits) - 1u;
+        if ((user2 & command_mask) != 0u || address_bits < 8u)
+            return transaction;
+    }
+
+    if ((user & SPI_USER_ADDR) && address_bits >= 8u) {
+        transaction.opcode = (uint8_t)(address >> 24);
+        transaction.opcode_bits = 8u;
+        transaction.opcode_valid = true;
+        transaction.address = spi_mem_address_tail(
+            address, address_bits, 8u);
+        return transaction;
+    }
+
+    /* QPI-exit on the same device is intentionally emitted as raw MOSI data.
+     * Some clock modes insert complete zero bytes before the opcode. Treat
+     * only leading zeroes as padding; subsequent bytes remain payload. */
+    if ((user & SPI_USER_MOSI) && transaction.mosi_bytes > 0) {
+        int byte = 0;
+        while (byte < transaction.mosi_bytes &&
+               transaction.mosi[byte] == 0u)
+            byte++;
+        if (byte < transaction.mosi_bytes) {
+            transaction.opcode = transaction.mosi[byte++];
+            transaction.opcode_bits = 8u;
+            transaction.opcode_valid = true;
+            transaction.mosi += byte;
+            transaction.mosi_bytes -= byte;
+        }
+    }
+    return transaction;
+}
+
+typedef enum {
+    SPI_MEM_DEVICE_NONE,
+    SPI_MEM_DEVICE_FLASH,
+    SPI_MEM_DEVICE_PSRAM,
+    SPI_MEM_DEVICE_CONTENTION,
+} spi_mem_device_t;
+
+static spi_mem_device_t spi_mem_selected_device(
+        const flexe_spi_mem_t *spi_mem, const spi_mem_host_t *host) {
+    const flexe_spi_mem_desc_t *desc = &spi_mem->target->spi_mem;
+    uint32_t disabled = host->reg[
+        spi_mem->layout->chip_select_offset / 4u];
+    bool flash = (disabled & (UINT32_C(1) <<
+                              desc->flash_chip_select)) == 0u;
+    bool psram = desc->psram_kind != FLEXE_SPI_MEM_PSRAM_NONE &&
+                 (disabled & (UINT32_C(1) <<
+                              desc->psram_chip_select)) == 0u;
+    if (flash && psram) return SPI_MEM_DEVICE_CONTENTION;
+    if (flash) return SPI_MEM_DEVICE_FLASH;
+    if (psram) return SPI_MEM_DEVICE_PSRAM;
+    return SPI_MEM_DEVICE_NONE;
+}
+
+enum { SPI_DBG_OFF, SPI_DBG_BOOT, SPI_DBG_ALL, SPI_DBG_RANGE };
+static int spi_dbg_mode = -1;
+static unsigned long spi_dbg_first;
+static unsigned long spi_dbg_last;
+
+static void spi_debug_resolve(void) {
+    const char *spec = getenv("FLEXE_SPIDBG");
+    if (!spec) { spi_dbg_mode = SPI_DBG_OFF; return; }
+    if (*spec == '\0') { spi_dbg_mode = SPI_DBG_BOOT; return; }
+    if (strcmp(spec, "all") == 0) { spi_dbg_mode = SPI_DBG_ALL; return; }
+
+    spi_dbg_mode = SPI_DBG_BOOT;
+    errno = 0;
+    char *end = NULL;
+    unsigned long first = strtoul(spec, &end, 0);
+    if (errno || end == spec) return;
+    unsigned long last = first;
+    if (*end == '-') {
+        const char *tail = end + 1;
+        errno = 0;
+        last = strtoul(tail, &end, 0);
+        if (errno || end == tail) return;
+    }
+    if (*end != '\0') return;
+    spi_dbg_first = first;
+    spi_dbg_last = last;
+    spi_dbg_mode = SPI_DBG_RANGE;
+}
+
+static bool spi_debug_offset(uint32_t offset) {
+    if (spi_dbg_mode < 0) spi_debug_resolve();
+    switch (spi_dbg_mode) {
+    case SPI_DBG_OFF: return false;
+    case SPI_DBG_ALL: return true;
+    case SPI_DBG_RANGE:
+        return (unsigned long)offset >= spi_dbg_first &&
+               (unsigned long)offset <= spi_dbg_last;
+    default: return offset < 0x20000u;
+    }
+}
+
+static void spi_debug_command(unsigned host, const spi_mem_host_t *state,
+                              const spi_mem_layout_desc_t *layout,
+                              uint16_t opcode, uint32_t offset,
+                              int mosi, int miso) {
+    if (!spi_debug_offset(offset)) return;
+    fprintf(stderr,
+            "[SPI%u] op=%04X off=0x%06X mosi=%d miso=%d pc=%08X core=%d "
+            "user=%08X user1=%08X user2=%08X addr=%08X cs=%08X w0=%08X\n",
+            host, opcode, offset, mosi, miso, g_dbg_pc, g_dbg_core,
+            state->reg[layout->user_offset / 4u],
+            state->reg[layout->user1_offset / 4u],
+            state->reg[layout->user2_offset / 4u], state->reg[1],
+            state->reg[layout->chip_select_offset / 4u],
+            state->reg[layout->buffer_offset / 4u]);
+}
+
+static uint8_t *spi_mem_prepare_input(flexe_spi_mem_t *spi_mem,
+                                      spi_mem_host_t *host) {
+    uint32_t *all = &host->reg[spi_mem->layout->buffer_offset / 4u];
+    memset(all, 0xFF, SPI_MEM_BUFFER_WORDS * sizeof(*all));
+    return (uint8_t *)spi_mem_buffer(spi_mem, host, true);
+}
+
+static void spi_mem_set_input_word(flexe_spi_mem_t *spi_mem,
+                                   spi_mem_host_t *host, uint32_t value) {
+    uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
+    for (unsigned byte = 0; byte < sizeof(value); byte++)
+        dst[byte] = (uint8_t)(value >> (byte * 8u));
+}
+
+static void spi_mem_set_input_u64(flexe_spi_mem_t *spi_mem,
+                                  spi_mem_host_t *host, uint64_t value) {
+    uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
+    for (unsigned byte = 0; byte < sizeof(value); byte++)
+        dst[byte] = (uint8_t)(value >> (byte * 8u));
+}
+
+static void spi_mem_read_data(flexe_spi_mem_t *spi_mem,
+                              spi_mem_host_t *host,
+                              uint32_t offset, int bytes) {
+    uint32_t size = spi_mem_flash_size(spi_mem);
+    uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
+    if (offset < size && spi_mem->mem->flash_data) {
+        uint32_t available = size - offset;
+        if ((uint32_t)bytes > available) bytes = (int)available;
+        memcpy(dst, spi_mem->mem->flash_data + offset, (size_t)bytes);
+    }
+    if (spi_debug_offset(offset)) {
+        fprintf(stderr,
+                "[SPIRD] off=0x%X bytes=%d w0=%02X %02X %02X %02X "
+                "%02X %02X %02X %02X\n",
+                offset, bytes, dst[0], dst[1], dst[2], dst[3],
+                dst[4], dst[5], dst[6], dst[7]);
+    }
+}
+
+static bool spi_mem_read_sfdp(flexe_spi_mem_t *spi_mem,
+                               spi_mem_host_t *host,
+                               uint32_t offset, int bytes) {
+    bool gd25q64c = spi_mem_is_gd25q64c(spi_mem);
+    if (!spi_mem_is_gd25q32c(spi_mem) && !gd25q64c) return false;
+
+    uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
+    for (int i = 0; i < bytes; i++) {
+        uint32_t address = offset + (uint32_t)i;
+        if (address < sizeof(GD25Q32C_SFDP))
+            dst[i] = gd25q64c && address == 0x37u ? 0x03u :
+                     GD25Q32C_SFDP[address];
+    }
+    return true;
+}
+
+static void spi_mem_read_psram(flexe_spi_mem_t *spi_mem,
+                               spi_mem_host_t *host,
+                               uint32_t offset, int bytes) {
+    uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
+    uint32_t size = mem_backing_size(spi_mem->mem, FLEXE_MEM_PSRAM);
+    uint8_t *src = mem_backing_ptr(spi_mem->mem, FLEXE_MEM_PSRAM);
+    if (!src || size == 0u) return;
+    for (int byte = 0; byte < bytes; byte++)
+        dst[byte] = src[(offset + (uint32_t)byte) % size];
+}
+
+static void spi_mem_write_psram(flexe_spi_mem_t *spi_mem,
+                                uint32_t offset, const uint8_t *src,
+                                int bytes) {
+    uint32_t size = mem_backing_size(spi_mem->mem, FLEXE_MEM_PSRAM);
+    uint8_t *dst = mem_backing_ptr(spi_mem->mem, FLEXE_MEM_PSRAM);
+    if (!src || !dst || size == 0u) return;
+    for (int byte = 0; byte < bytes; byte++)
+        dst[(offset + (uint32_t)byte) % size] = src[byte];
+}
+
+static void spi_mem_note_flash_change(flexe_spi_mem_t *spi_mem,
+                                      uint32_t offset, uint32_t size) {
+    if (spi_mem->flash_changed)
+        spi_mem->flash_changed(spi_mem->flash_changed_ctx, offset, size);
+}
+
+static spi_mem_write_result_t spi_mem_program(flexe_spi_mem_t *spi_mem,
+                                               uint32_t offset,
+                                               const uint8_t *src, int bytes) {
+    uint32_t size = spi_mem_flash_size(spi_mem);
+    if (offset >= size || !spi_mem->mem->flash_data ||
+        !spi_mem->mem->flash_insn || !src || bytes <= 0)
+        return SPI_MEM_WRITE_ALLOWED;
+    uint32_t page = offset & ~0xFFu;
+    spi_mem_write_result_t gate = spi_mem_write_gate(spi_mem, page, 0x100u);
+    if (gate != SPI_MEM_WRITE_ALLOWED) return gate;
+    if (spi_debug_offset(offset)) {
+        fprintf(stderr,
+                "[SPIWR] off=0x%X bytes=%d w0=%02X %02X %02X %02X "
+                "%02X %02X %02X %02X\n",
+                offset, bytes, src[0], src[1], src[2], src[3],
+                src[4], src[5], src[6], src[7]);
+    }
+    for (int i = 0; i < bytes; i++) {
+        uint32_t address = page | ((offset + (uint32_t)i) & 0xFFu);
+        spi_mem->mem->flash_data[address] &= src[i];
+        spi_mem->mem->flash_insn[address] &= src[i];
+    }
+    uint32_t first = 0x100u - (offset & 0xFFu);
+    if (first > (uint32_t)bytes) first = (uint32_t)bytes;
+    spi_mem_note_flash_change(spi_mem, offset, first);
+    if ((uint32_t)bytes > first)
+        spi_mem_note_flash_change(spi_mem, page, (uint32_t)bytes - first);
+    return SPI_MEM_WRITE_ALLOWED;
+}
+
+static spi_mem_write_result_t spi_mem_erase(flexe_spi_mem_t *spi_mem,
+                                             uint32_t offset, uint32_t size) {
+    uint32_t flash_size = spi_mem_flash_size(spi_mem);
+    if (offset >= flash_size || !spi_mem->mem->flash_data ||
+        !spi_mem->mem->flash_insn)
+        return SPI_MEM_WRITE_ALLOWED;
+    if (size > flash_size - offset) size = flash_size - offset;
+    spi_mem_write_result_t gate = spi_mem_write_gate(spi_mem, offset, size);
+    if (gate != SPI_MEM_WRITE_ALLOWED) return gate;
+    if (spi_debug_offset(offset))
+        fprintf(stderr, "[SPIERASE] off=0x%X bytes=%u\n", offset, size);
+    memset(spi_mem->mem->flash_data + offset, 0xFF, size);
+    memset(spi_mem->mem->flash_insn + offset, 0xFF, size);
+    spi_mem_note_flash_change(spi_mem, offset, size);
+    return SPI_MEM_WRITE_ALLOWED;
+}
+
+static bool spi_mem_execute_flash(flexe_spi_mem_t *spi_mem,
+                                  spi_mem_host_t *host,
+                                  const spi_mem_transaction_t *transaction) {
+    if (transaction->opcode_bits != 8u) return false;
+    spi_nor_state_t *flash = &spi_mem->flash;
+    uint8_t opcode = transaction->opcode;
+    uint32_t offset = transaction->address;
+    int mosi = transaction->mosi_bytes;
+
+    if (flash->powered_down && opcode != 0xABu) {
+        spi_mem_prepare_input(spi_mem, host);
+        return true;
+    }
+
+    switch (opcode) {
+    case 0x9Fu: /* RDID */
+    case 0x90u: /* REMID */
+        spi_mem_set_input_word(spi_mem, host,
+                               mem_flash_jedec_id(spi_mem->mem));
+        return true;
+    case 0xABu: /* release power-down / electronic signature */
+        flash->powered_down = false;
+        spi_mem_set_input_word(spi_mem, host,
+                               mem_flash_jedec_id(spi_mem->mem));
+        return true;
+    case 0xB9u: flash->powered_down = true; return true;
+    case 0x05u:
+        spi_mem_set_input_word(spi_mem, host, flash->status[0]);
+        return true;
+    case 0x35u:
+        spi_mem_set_input_word(spi_mem, host, flash->status[1]);
+        return true;
+    case 0x15u:
+        spi_mem_set_input_word(spi_mem, host, flash->status[2]);
+        return true;
+    case 0x01u:
+        if (!(flash->status[0] & FLASH_SR_WEL) || mosi == 0) return true;
+        flash->status[0] = (uint8_t)(
+            (flash->status[0] & (FLASH_SR_WIP | FLASH_SR_WEL)) |
+            (transaction->mosi[0] & ~(FLASH_SR_WIP | FLASH_SR_WEL)));
+        if (mosi >= 2) flash->status[1] = transaction->mosi[1];
+        flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        return true;
+    case 0x31u:
+        if ((flash->status[0] & FLASH_SR_WEL) && mosi > 0) {
+            flash->status[1] = transaction->mosi[0];
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        return true;
+    case 0x11u:
+        if ((flash->status[0] & FLASH_SR_WEL) && mosi > 0) {
+            flash->status[2] = transaction->mosi[0];
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        return true;
+    case 0x06u: flash->status[0] |= FLASH_SR_WEL; return true;
+    case 0x04u: flash->status[0] &= (uint8_t)~FLASH_SR_WEL; return true;
+    case 0x5Au: /* Read serial flash discoverable parameters. */
+        return spi_mem_read_sfdp(spi_mem, host, offset,
+                                 transaction->miso_bytes);
+    case 0x03u: case 0x0Bu: case 0x3Bu:
+    case 0x6Bu: case 0xBBu: case 0xEBu:
+        spi_mem_read_data(spi_mem, host, offset, transaction->miso_bytes);
+        return true;
+    case 0x02u: case 0x32u:
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_program(spi_mem, offset, transaction->mosi, mosi) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        return true;
+    case 0x20u:
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_erase(spi_mem, offset & ~0xFFFu, 0x1000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        return true;
+    case 0x52u:
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_erase(spi_mem, offset & ~0x7FFFu, 0x8000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        return true;
+    case 0xD8u:
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_erase(spi_mem, offset & ~0xFFFFu, 0x10000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        return true;
+    case 0x60u: case 0xC7u:
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_erase(spi_mem, 0u, spi_mem_flash_size(spi_mem)) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        return true;
+    case 0x66u: flash->reset_armed = true; return true;
+    case 0x99u:
+        if (flash->reset_armed) {
+            /* RESET clears WIP/WEL and volatile modes, not the NOR's
+             * nonvolatile protection, quad-enable or drive-strength bits. */
+            spi_mem_nor_clear_volatile(spi_mem);
+        }
+        return true;
+    case 0xB7u: flash->address_4byte = true; return true;
+    case 0xE9u: flash->address_4byte = false; return true;
+    default: return false;
+    }
+}
+
+/* APS6408L-3OBMx mode-register defaults (AP Memory rev 4.0, tables 9-18).
+ * MR1/MR2/MR3 identify the physical device; only MR0/MR4/MR8 are writable.
+ * Command bytes are repeated on both DDR edges of the S3 octal bus. */
+static void spi_mem_ap_psram_reset(spi_psram_state_t *psram) {
+    psram->mr0 = 0x09u; /* read latency 6, 1/4 drive strength */
+    psram->mr4 = 0x40u; /* write latency 5, fast refresh */
+    psram->mr8 = 0x05u; /* 32-byte burst, hybrid wrap */
+}
+
+static uint8_t spi_mem_ap_mode_read(const spi_psram_state_t *psram,
+                                     uint32_t address) {
+    switch (address) {
+    case 0u: return psram->mr0;
+    case 1u: return 0x0Du; /* AP Memory vendor ID */
+    case 2u: return 0x93u; /* good die, gen 3, 64 Mbit */
+    case 3u: return 0xE0u; /* row crossing, 3 V, fast refresh */
+    case 4u: return psram->mr4;
+    case 8u: return psram->mr8;
+    default: return 0xFFu;
+    }
+}
+
+static uint32_t spi_mem_ap_array_address(
+        const spi_psram_state_t *psram, uint32_t start, uint32_t byte,
+        bool linear, bool read) {
+    uint32_t row = start & ~0x3FFu;
+    uint32_t column = start & 0x3FFu;
+    if (linear) {
+        /* Linear bursts otherwise wrap at the 1 KiB row boundary. Only
+         * reads may cross into the next row when MR8[3] enables RBX. */
+        if (read && (psram->mr8 & 0x08u)) return start + byte;
+        return row | ((column + byte) & 0x3FFu);
+    }
+
+    uint32_t burst = (psram->mr8 & 0x03u) == 3u ?
+                     1024u : 16u << (psram->mr8 & 0x03u);
+    uint32_t base = column & ~(burst - 1u);
+    uint32_t offset = column & (burst - 1u);
+    if ((psram->mr8 & 0x04u) == 0u || byte < burst)
+        return row | (base + ((offset + byte) & (burst - 1u)));
+    /* Hybrid wrap visits the initial burst once, then proceeds to the end
+     * of the 1 KiB column and wraps within that row. */
+    return row | ((base + byte) & 0x3FFu);
+}
+
+static bool spi_mem_ap_array_transfer(
+        flexe_spi_mem_t *spi_mem, spi_mem_host_t *host,
+        const spi_mem_transaction_t *transaction, bool linear, bool read) {
+    uint8_t *array = mem_backing_ptr(spi_mem->mem, FLEXE_MEM_PSRAM);
+    uint32_t size = mem_backing_size(spi_mem->mem, FLEXE_MEM_PSRAM);
+    if (!array || size == 0u) return false;
+    uint8_t *input = read ? spi_mem_prepare_input(spi_mem, host) : NULL;
+    int count = read ? transaction->miso_bytes : transaction->mosi_bytes;
+    for (int i = 0; i < count; i++) {
+        uint32_t address = spi_mem_ap_array_address(
+            &spi_mem->psram, transaction->address, (uint32_t)i,
+            linear, read) % size;
+        if (read) input[i] = array[address];
+        else array[address] = transaction->mosi[i];
+    }
+    return true;
+}
+
+static bool spi_mem_execute_ap_psram(
+        flexe_spi_mem_t *spi_mem, spi_mem_host_t *host,
+        const spi_mem_transaction_t *transaction) {
+    if (transaction->opcode_bits != 16u) return false;
+    spi_psram_state_t *psram = &spi_mem->psram;
+    uint32_t address = transaction->address;
+    switch (transaction->opcode) {
+    case 0x4040u: { /* mode register read */
+        if (address > 4u && address != 8u) return false;
+        uint8_t *dst = spi_mem_prepare_input(spi_mem, host);
+        for (int i = 0; i < transaction->miso_bytes; i++)
+            dst[i] = spi_mem_ap_mode_read(psram, address + (uint32_t)i);
+        return true;
+    }
+    case 0xC0C0u: /* mode register write */
+        if (transaction->mosi_bytes == 0) return false;
+        switch (address) {
+        case 0u: psram->mr0 = transaction->mosi[0] & 0x3Fu; return true;
+        case 4u: psram->mr4 = transaction->mosi[0] & 0xEFu; return true;
+        case 8u: psram->mr8 = transaction->mosi[0] & 0x0Fu; return true;
+        default: return false;
+        }
+    case 0x0000u: /* synchronous read */
+        return spi_mem_ap_array_transfer(spi_mem, host, transaction,
+                                          false, true);
+    case 0x2020u: /* linear read */
+        return spi_mem_ap_array_transfer(spi_mem, host, transaction,
+                                          true, true);
+    case 0x8080u: /* synchronous write */
+        return spi_mem_ap_array_transfer(spi_mem, host, transaction,
+                                          false, false);
+    case 0xA0A0u: /* linear write */
+        return spi_mem_ap_array_transfer(spi_mem, host, transaction,
+                                          true, false);
+    case 0xFFFFu: /* global reset, memory contents retained */
+        spi_mem_ap_psram_reset(psram);
+        return true;
+    default: return false;
+    }
+}
+
+static bool spi_mem_execute_quad_psram(flexe_spi_mem_t *spi_mem,
+                                       spi_mem_host_t *host,
+                                       const spi_mem_transaction_t *transaction) {
+    if (transaction->opcode_bits != 8u) return false;
+    spi_psram_state_t *psram = &spi_mem->psram;
+    switch (transaction->opcode) {
+    case 0x9Fu: /* device ID */
+        spi_mem_set_input_u64(
+            spi_mem, host, spi_mem->target->spi_mem.default_psram_id);
+        return true;
+    case 0x03u: /* read */
+    case 0x0Bu: /* fast read */
+    case 0xEBu: /* quad fast read */
+        spi_mem_read_psram(spi_mem, host, transaction->address,
+                           transaction->miso_bytes);
+        return true;
+    case 0x02u: /* write */
+    case 0x38u: /* quad write */
+        spi_mem_write_psram(spi_mem, transaction->address,
+                            transaction->mosi, transaction->mosi_bytes);
+        return true;
+    case 0x35u: psram->qpi = true; return true;
+    case 0xF5u: psram->qpi = false; return true;
+    case 0x66u: psram->reset_armed = true; return true;
+    case 0x99u:
+        if (psram->reset_armed) {
+            psram->reset_armed = false;
+            psram->qpi = false;
+            psram->burst_32 = false;
+        }
+        return true;
+    case 0xC0u:
+        psram->burst_32 = !psram->burst_32;
+        return true;
+    /* ESP32's optional 2T training sequence uses these documented device
+     * commands. The intervening electrical training clocks do not change the
+     * byte-addressable storage model, but the commands are valid. */
+    case 0x5Eu:
+    case 0x5Fu:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool spi_mem_execute_user(flexe_spi_mem_t *spi_mem, unsigned index,
+                                 spi_mem_host_t *host) {
+    spi_mem_transaction_t transaction =
+        spi_mem_decode_user(spi_mem, host);
+    spi_debug_command(index, host, spi_mem->layout, transaction.opcode,
+                      transaction.address, transaction.mosi_bytes,
+                      transaction.miso_bytes);
+    spi_mem_device_t device = spi_mem_selected_device(spi_mem, host);
+    /* SPI clocks still complete when no connected slave is selected. The
+     * command width/encoding only matters to a device that sees the wires;
+     * in particular, an absent S3 CS1 must not reject octal-PSRAM probes. */
+    if (device == SPI_MEM_DEVICE_NONE) {
+        if (transaction.miso_bytes > 0)
+            spi_mem_prepare_input(spi_mem, host);
+        return true;
+    }
+    if (!transaction.opcode_valid) return false;
+
+    switch (device) {
+    case SPI_MEM_DEVICE_FLASH:
+        return spi_mem_execute_flash(spi_mem, host, &transaction);
+    case SPI_MEM_DEVICE_PSRAM:
+        return spi_mem->target->spi_mem.psram_kind ==
+               FLEXE_SPI_MEM_PSRAM_AP_8M_OPI ?
+               spi_mem_execute_ap_psram(spi_mem, host, &transaction) :
+               spi_mem_execute_quad_psram(spi_mem, host, &transaction);
+    case SPI_MEM_DEVICE_CONTENTION:
+    case SPI_MEM_DEVICE_NONE: /* Already handled above. */
+    default:
+        return false;
+    }
+}
+
+static bool spi_mem_execute_dedicated(flexe_spi_mem_t *spi_mem,
+                                      spi_mem_host_t *host,
+                                      uint32_t command) {
+    spi_nor_state_t *flash = &spi_mem->flash;
+    bool handled = false;
+    uint32_t addr = host->reg[1];
+    uint32_t offset = spi_mem->layout->packed_program_length ||
+                      !flash->address_4byte ? addr & 0x00FFFFFFu : addr;
+    if (command & SPI_CMD_FLASH_RDID) {
+        spi_mem_set_input_word(spi_mem, host,
+                               mem_flash_jedec_id(spi_mem->mem));
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_RDSR) {
+        host->reg[spi_mem->layout->status_offset / 4u] =
+            flash->status[0] | ((uint32_t)flash->status[1] << 8) |
+            ((uint32_t)flash->status[2] << 16);
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_WRDI) {
+        flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_WREN) {
+        flash->status[0] |= FLASH_SR_WEL;
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_WRSR) {
+        if (flash->status[0] & FLASH_SR_WEL) {
+            uint32_t value = *spi_mem_buffer(spi_mem, host, false);
+            flash->status[0] = (uint8_t)(
+                (flash->status[0] & (FLASH_SR_WIP | FLASH_SR_WEL)) |
+                (value & ~(FLASH_SR_WIP | FLASH_SR_WEL)));
+            flash->status[1] = (uint8_t)(value >> 8);
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_READ) {
+        spi_mem_read_data(
+            spi_mem, host, offset,
+            spi_mem_data_bytes(
+                spi_mem,
+                host->reg[spi_mem->layout->miso_dlen_offset / 4u],
+                host, true));
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_PP) {
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_program(
+                spi_mem, offset,
+                (const uint8_t *)spi_mem_buffer(spi_mem, host, false),
+                spi_mem_program_bytes(spi_mem, host)) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_SE) {
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_erase(spi_mem, offset & ~0xFFFu, 0x1000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_BE) {
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_erase(spi_mem, offset & ~0xFFFFu, 0x10000u) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_CE) {
+        if (flash->status[0] & FLASH_SR_WEL) {
+            if (spi_mem_erase(spi_mem, 0u, spi_mem_flash_size(spi_mem)) ==
+                SPI_MEM_WRITE_UNSUPPORTED) return false;
+            flash->status[0] &= (uint8_t)~FLASH_SR_WEL;
+        }
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_RES) {
+        flash->powered_down = false;
+        host->reg[spi_mem->layout->status_offset / 4u] =
+            mem_flash_jedec_id(spi_mem->mem);
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_DP) {
+        flash->powered_down = true;
+        handled = true;
+    }
+    if (command & SPI_CMD_FLASH_HPM) handled = true;
+    return handled;
+}
+
+static void spi_mem_execute(flexe_spi_mem_t *spi_mem, unsigned index,
+                            uint32_t command) {
+    spi_mem_host_t *host = &spi_mem->host[index];
+    bool handled = false;
+    if (command & SPI_CMD_USR)
+        handled = spi_mem_execute_user(spi_mem, index, host);
+    else
+        handled = spi_mem_execute_dedicated(spi_mem, host, command);
+
+    /* FLASH_PE qualifies a USR transaction rather than naming a command by
+     * itself. An unknown transaction must remain visible instead of looking
+     * like successful flash I/O merely because CMD self-cleared. */
+    uint32_t qualifiers = SPI_CMD_FLASH_PE;
+    if (!handled && (command & ~qualifiers) != 0u &&
+        spi_mem->fallback_write)
+        spi_mem->fallback_write(
+            spi_mem->fallback_ctx,
+            spi_mem->target->spi_mem.base[index], command);
+}
+
+static uint32_t spi_mem_read(void *ctx, uint32_t addr) {
+    flexe_spi_mem_t *spi_mem = ctx;
+    int index = spi_mem_host_index(spi_mem, addr);
+    if (index < 0) goto fallback;
+    uint32_t offset = addr - spi_mem->target->spi_mem.base[index];
+    if (!spi_mem_known_offset(spi_mem->target->spi_mem.layout, offset))
+        goto fallback;
+    uint32_t shift = (offset & 3u) * 8u;
+    offset &= ~3u;
+    spi_mem_host_t *host = &spi_mem->host[index];
+    uint32_t value = 0u;
+    if (offset == 0u || offset == spi_mem->layout->fsm_offset)
+        value = 0u; /* command completed and state machine idle */
+    else if (offset == spi_mem->layout->date_offset)
+        value = host->date;
+    else if (spi_mem->target->spi_mem.layout ==
+                 FLEXE_SPI_MEM_LAYOUT_S2_S3 &&
+             offset == 0x0FCu)
+        value = host->reg[0x0F8u / 4u] & host->reg[0x0F0u / 4u];
+    else if (offset < sizeof(host->reg))
+        value = host->reg[offset / 4u];
+    else
+        goto fallback;
+    /* Memory's width-specific slow paths truncate the returned value. Shift
+     * the addressed byte lane down first so byte copies of W0..W15 observe
+     * the actual data buffer rather than four copies of each word's byte 0. */
+    return value >> shift;
+
+fallback:
+    return spi_mem->fallback_read ?
+        spi_mem->fallback_read(spi_mem->fallback_ctx, addr) : 0u;
+}
+
+static void spi_mem_write(void *ctx, uint32_t addr, uint32_t value) {
+    flexe_spi_mem_t *spi_mem = ctx;
+    int index = spi_mem_host_index(spi_mem, addr);
+    if (index < 0) goto fallback;
+    uint32_t offset = addr - spi_mem->target->spi_mem.base[index];
+    if (!spi_mem_known_offset(spi_mem->target->spi_mem.layout, offset))
+        goto fallback;
+    uint32_t byte_lane = offset & 3u;
+    offset &= ~3u;
+    spi_mem_host_t *host = &spi_mem->host[index];
+    if (offset == 0u && byte_lane == 0u) {
+        spi_mem_execute(spi_mem, (unsigned)index, value);
+        return;
+    }
+    if (offset == spi_mem->layout->status_offset ||
+        offset == spi_mem->layout->fsm_offset)
+        return;
+    if (offset == spi_mem->layout->date_offset) {
+        if (spi_mem->layout->date_writable) host->date = value;
+        return;
+    }
+    if (spi_mem->target->spi_mem.layout == FLEXE_SPI_MEM_LAYOUT_S2_S3) {
+        if (offset == 0x0F4u || offset == 0x0F8u) {
+            host->reg[0x0F8u / 4u] &= ~value;
+            return;
+        }
+        if (offset == 0x0FCu) return;
+    }
+    if (offset < sizeof(host->reg)) {
+        if (byte_lane == 0u) {
+            host->reg[offset / 4u] = value;
+        } else {
+            uint32_t shift = byte_lane * 8u;
+            uint32_t mask = 0xFFu << shift;
+            host->reg[offset / 4u] =
+                (host->reg[offset / 4u] & ~mask) |
+                ((value & 0xFFu) << shift);
+        }
+        return;
+    }
+
+fallback:
+    if (spi_mem->fallback_write)
+        spi_mem->fallback_write(spi_mem->fallback_ctx, addr, value);
+}
+
+flexe_spi_mem_t *flexe_spi_mem_create(
+    xtensa_mem_t *mem, mmio_read_fn fallback_read,
+    mmio_write_fn fallback_write, void *fallback_ctx,
+    flexe_spi_mem_flash_changed_fn flash_changed, void *flash_changed_ctx) {
+    if (!mem) return NULL;
+    const flexe_target_desc_t *target = mem_target(mem);
+    const spi_mem_layout_desc_t *layout =
+        target ? spi_mem_layout(target->spi_mem.layout) : NULL;
+    if (!spi_mem_geometry_valid(target, layout)) return NULL;
+
+    flexe_spi_mem_t *spi_mem = calloc(1, sizeof(*spi_mem));
+    if (!spi_mem) return NULL;
+    spi_mem->mem = mem;
+    spi_mem->target = target;
+    spi_mem->layout = layout;
+    spi_mem->fallback_read = fallback_read;
+    spi_mem->fallback_write = fallback_write;
+    spi_mem->fallback_ctx = fallback_ctx;
+    spi_mem->flash_changed = flash_changed;
+    spi_mem->flash_changed_ctx = flash_changed_ctx;
+    if (target->spi_mem.psram_kind == FLEXE_SPI_MEM_PSRAM_AP_8M_OPI)
+        spi_mem_ap_psram_reset(&spi_mem->psram);
+    if (spi_mem_is_gd25q32c(spi_mem))
+        spi_mem->flash.status[2] = 0x20u; /* GD25Q32C DRV0 reset bit. */
+
+    for (unsigned host = 0; host < target->spi_mem.host_count; host++) {
+        spi_mem_host_t *state = &spi_mem->host[host];
+        state->reg[layout->user_offset / 4u] = layout->user_reset;
+        state->reg[layout->user1_offset / 4u] = layout->user1_reset;
+        state->reg[layout->user2_offset / 4u] = layout->user2_reset;
+        state->reg[layout->chip_select_offset / 4u] =
+            layout->chip_select_reset;
+        state->date = target->spi_mem.date_reset;
+        if (mem_register_mmio_range(mem, target->spi_mem.base[host],
+                                    target->spi_mem.register_size,
+                                    spi_mem_read, spi_mem_write,
+                                    spi_mem) != 0) {
+            for (unsigned undo = 0; undo < host; undo++)
+                (void)mem_register_mmio_range(
+                    mem, target->spi_mem.base[undo],
+                    target->spi_mem.register_size, NULL, NULL, NULL);
+            free(spi_mem);
+            return NULL;
+        }
+    }
+    return spi_mem;
+}
+
+void flexe_spi_mem_destroy(flexe_spi_mem_t *spi_mem) {
+    if (!spi_mem) return;
+    for (unsigned host = 0;
+         host < spi_mem->target->spi_mem.host_count; host++)
+        (void)mem_register_mmio_range(
+            spi_mem->mem, spi_mem->target->spi_mem.base[host],
+            spi_mem->target->spi_mem.register_size, NULL, NULL, NULL);
+    free(spi_mem);
+}
+
+void flexe_spi_mem_nor_snapshot(const flexe_spi_mem_t *spi_mem,
+                                flexe_spi_mem_nor_state_t *out) {
+    if (!out) return;
+    *out = spi_mem ? spi_mem->flash : (flexe_spi_mem_nor_state_t){0};
+}
+
+void flexe_spi_mem_nor_restore(flexe_spi_mem_t *spi_mem,
+                               const flexe_spi_mem_nor_state_t *state,
+                               bool power_cycle) {
+    if (!spi_mem || !state) return;
+    if (power_cycle && !spi_mem_is_gd25q32c(spi_mem)) {
+        /* No assumed status-bit map for another capacity/device profile. */
+        if ((state->status[0] & 0xFCu) != 0u ||
+            state->status[1] != 0u || state->status[2] != 0u)
+            fprintf(stderr,
+                    "[spi-mem] unsupported nonvolatile status retention "
+                    "after flash power cycle (JEDEC %06X)\n",
+                    mem_flash_jedec_id(spi_mem->mem));
+        return;
+    }
+    spi_mem->flash = *state;
+    if (power_cycle) spi_mem_nor_clear_volatile(spi_mem);
+}
+
+void flexe_spi_mem_psram_snapshot(const flexe_spi_mem_t *spi_mem,
+                                  flexe_spi_mem_psram_state_t *out) {
+    if (!out) return;
+    *out = spi_mem ? spi_mem->psram : (flexe_spi_mem_psram_state_t){0};
+}
+
+void flexe_spi_mem_psram_restore(flexe_spi_mem_t *spi_mem,
+                                 const flexe_spi_mem_psram_state_t *state,
+                                 bool power_cycle) {
+    if (!spi_mem || !state || power_cycle) return;
+    spi_mem->psram = *state;
+}
