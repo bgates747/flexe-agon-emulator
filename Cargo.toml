@@ -10,8 +10,8 @@ license = "GPL-3.0"
 [package]
 name = "flexe-agon-emulator"
 keywords = ["Agon Light", "Agon Console8", "emulator"]
-homepage = "https://github.com/bgates747/flex-agon-emulator"
-repository = "https://github.com/bgates747/flex-agon-emulator"
+homepage = "https://github.com/bgates747/flexe-agon-emulator"
+repository = "https://github.com/bgates747/flexe-agon-emulator"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
