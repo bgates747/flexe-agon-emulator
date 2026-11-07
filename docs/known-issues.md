@@ -1,4 +1,4 @@
-# Known issues — 0.1.0 source review candidate
+# Known issues — 0.1.0-alpha source release
 
 This list describes user-visible limitations of the selected source candidate.
 It does not claim that every reported stall has the same cause, or that a

@@ -1,12 +1,12 @@
 {
   "date": "2026-11-06",
   "scope": "Locked Linux workspace dependency census for this source-only candidate; no firmware, assets, host shared libraries or binaries bundled. Licence declarations are not a replacement for the actual component notices.",
-  "cargo_lock_sha256": "b80ae5fa9f046c15e8222570fe0749ed907ff0664beafd6cf657555d1eff5405",
+  "cargo_lock_sha256": "baf87b325296a293a0abfcda2b06619acc0dd4fe138c7568071503a80cf899dc",
   "package_count": 64,
   "packages": [
     {
       "name": "agon-cli-emulator",
-      "version": "0.1.0",
+      "version": "0.1.0-alpha",
       "authors": [
         "Tom Morton <tomm8086@gmail.com>"
       ],
@@ -18,7 +18,7 @@
     },
     {
       "name": "agon-ez80-emulator",
-      "version": "0.1.0",
+      "version": "0.1.0-alpha",
       "authors": [
         "Tom Morton <tomm8086@gmail.com>"
       ],
@@ -30,7 +30,7 @@
     },
     {
       "name": "agon-light-emulator-debugger",
-      "version": "0.1.0",
+      "version": "0.1.0-alpha",
       "authors": [
         "Tom Morton <tomm8086@gmail.com>"
       ],
@@ -185,7 +185,7 @@
     },
     {
       "name": "flexe-agon-emulator",
-      "version": "0.1.0",
+      "version": "0.1.0-alpha",
       "authors": [
         "Tom Morton <tomm8086@gmail.com>"
       ],

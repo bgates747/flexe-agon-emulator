@@ -1,8 +1,8 @@
 {
   "product": "Flexe Agon Emulator",
-  "version": "0.1.0",
-  "candidate": "0.1.0-rc1",
-  "status": "source-review-candidate",
+  "version": "0.1.0-alpha",
+  "candidate": "0.1.0-alpha",
+  "status": "alpha",
   "distribution": "source-only; no firmware, SD/application assets or binaries",
   "frontend_base": {
     "repository": "https://github.com/tomm/fab-agon-emulator",

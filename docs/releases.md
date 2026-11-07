@@ -1,6 +1,6 @@
 # Release notes
 
-## 0.1.0 source review candidate
+## 0.1.0-alpha source release
 
 This candidate packages the independently maintained Fab/Flexe integration as
 production source, with standalone profile creation and explicit dependencies.

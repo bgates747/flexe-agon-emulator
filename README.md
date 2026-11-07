@@ -5,7 +5,7 @@ Flexe Agon Emulator combines the eZ80, MOS, storage and SDL frontend of
 [Flexe](https://github.com/levkropp/flexe), executing actual classic ESP32 VDP
 firmware for video, audio and keyboard handling.
 
-This is the **0.1.0 source review candidate**, an independently maintained
+This is the **0.1.0-alpha source release**, an independently maintained
 derivative. Real firmware execution does not promise hardware timing or
 complete peripheral compatibility. Read the [known issues](docs/known-issues.md).
 
