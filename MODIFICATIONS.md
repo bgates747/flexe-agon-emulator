@@ -19,6 +19,8 @@ list does not assert sole authorship of every byte in a mixed file.
 | eZ80 peripheral model | FIFO/CTS/interrupt semantics and regressions; candidate HALT/IRQ wakeup, physical SRAM address masking and timer input/source routing |
 | Core integration patch | ARM64 host instruction cache, guest instruction/IRAM coherence, callback preservation and UART timeout corrections |
 | ULP/logging/EOF patches | RTC wake/scheduling integration, opt-in routine logging and preservation of I2S EOF descriptor witnesses |
+| F92 watchdog and eZ80 NMI | First-expiry watchdog ports and clock accounting, plus mixed-mode NMI entry in the pinned eZ80 library |
+| Core NVS build fix | Upstream bounded copies in NVS allocation avoid the GCC truncation error |
 | Build and distribution | Product name, portable source verification/locked dependency bootstrap, stable build-path remapping, generated stopped profiles and optional CPU budget helper |
 | Production engine source packaging | Unchanged pinned library sources/headers and MIT notice; CMake retains the library definition/options and omits unrelated CLI/developer/test/fixture targets. Patches still apply only to generated source. `vendor/flexe/SOURCE.json` records exact source identities. |
 | Documentation | Build/run/input instructions, edited release-specific known issues, provenance, credits and licensing scope |

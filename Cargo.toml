@@ -1,8 +1,9 @@
 [workspace]
 members = ["agon-light-emulator-debugger", "agon-ez80-emulator", "agon-cli-emulator"]
+exclude = ["vendor/ez80"]
 
 [workspace.package]
-version = "0.1.0-alpha"
+version = "0.1.1-rc1"
 edition = "2021"
 authors = ["Tom Morton <tomm8086@gmail.com>"]
 license = "GPL-3.0"

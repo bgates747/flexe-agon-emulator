@@ -1,5 +1,14 @@
 # Source candidate validation
 
+## 0.1.1-rc1
+
+The watchdog and NMI tests cover port readback, both modeled clock
+sources, first expiry, HALT wakeup under DI, mixed-mode stacks and RETN
+execution. The full source build and library checks ran on aarch64 Linux.
+End-to-end native guest and interactive runtime qualification are pending.
+
+## 0.1.0-alpha
+
 The production source and build/setup scripts in this candidate passed a
 Linux x86_64 source-archive build on November6,2026. This is build and functional
 unit-check evidence; it is not an interactive emulator or hardware result.

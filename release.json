@@ -1,8 +1,8 @@
 {
   "product": "Flexe Agon Emulator",
-  "version": "0.1.0-alpha",
-  "candidate": "0.1.0-alpha",
-  "status": "alpha",
+  "version": "0.1.1-rc1",
+  "candidate": "0.1.1-rc1",
+  "status": "prerelease",
   "distribution": "source-only; no firmware, SD/application assets or binaries",
   "frontend_base": {
     "repository": "https://github.com/tomm/fab-agon-emulator",
@@ -17,5 +17,11 @@
   "flexe_revision": "fbda8e905ccff36a090e4e33b0ffc2337dd79c52",
   "ez80_revision": "13c151e89f520b3bae3343bea9d67d06e8037cfa",
   "initial_binary_target": "x86_64-unknown-linux-gnu",
-  "runtime_acceptance": "pending"
+  "runtime_acceptance": "pending",
+  "ez80_source": {
+    "path": "vendor/ez80",
+    "repository": "https://github.com/tomm/ez80",
+    "revision": "13c151e89f520b3bae3343bea9d67d06e8037cfa",
+    "local_change": "eZ80 NMI entry"
+  }
 }

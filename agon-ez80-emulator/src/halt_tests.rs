@@ -9,7 +9,7 @@ impl uart::SerialLink for DisconnectedSerial {
     fn recv(&mut self) -> Option<u8> { None }
     fn read_clear_to_send(&mut self) -> bool { true }
 }
-fn fixture(precision: i32) -> (AgonMachine, Cpu) {
+pub(super) fn fixture(precision: i32) -> (AgonMachine, Cpu) {
     let (tx, _) = std::sync::mpsc::channel();
     let mut m = AgonMachine::new(AgonMachineConfig {
         uart0_link: Box::new(DisconnectedSerial), uart1_link: Box::new(DisconnectedSerial),

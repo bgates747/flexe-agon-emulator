@@ -19,7 +19,7 @@ fi
 mkdir -p build
 rm -rf -- build/flexe-source
 cp -R vendor/flexe build/flexe-source
-for name in integration ulp logging i2s-eof; do
+for name in integration ulp logging i2s-eof nvs; do
     patch --fuzz=0 -p1 -d build/flexe-source < "patches/flexe-$name.patch"
 done
 # Stable virtual source paths keep developer build roots out of compiled data.

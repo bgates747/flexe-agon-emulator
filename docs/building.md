@@ -25,7 +25,7 @@ make
 
 `BUILD_JOBS=2` is the default compiler concurrency. Set `CARGO`, `RUSTC`, `CC`
 or `PYTHON` to choose installed tools. The build verifies source checksums,
-applies the four integration patches only to `build/flexe-source`, builds the
+applies the Flexe patches only to `build/flexe-source`, builds the
 core/adapter, runs the required C and UART unit checks and builds the frontend.
 No firmware or SDL window is executed by those C/UART checks. CMake's host-CPU
 native tuning is disabled so it does not silently specialize distributed code

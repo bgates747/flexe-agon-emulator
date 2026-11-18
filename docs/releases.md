@@ -1,5 +1,23 @@
 # Release notes
 
+## 0.1.1-rc1 source prerelease
+
+The F92 watchdog can now wake the eZ80 from HALT and enter an NMI handler
+while maskable interrupts are disabled. The CPU saves the return frame
+for the interrupted memory mode. Host tests cover all four ADL/MADL
+combinations and instruction-level returns.
+
+A guest that selects watchdog chip reset receives an emulator stop with
+a diagnostic. Full chip reset, repeated watchdog expiry and use by a
+native program remain open. See [known issues](known-issues.md).
+
+This source-only prerelease carries the pinned
+[eZ80 library and NMI change](../vendor/ez80/README.md). The Fab and Flexe
+baselines below also apply to this prerelease.
+
+The Flexe build includes the upstream bounded-copy correction for the
+NVS compiler error reported in [issue #2](https://github.com/bgates747/flexe-agon-emulator/issues/2).
+
 ## 0.1.0-alpha source release
 
 This candidate packages the independently maintained Fab/Flexe integration as

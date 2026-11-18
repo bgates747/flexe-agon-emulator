@@ -45,3 +45,5 @@ applicable under GPLv3. Source-only build results do not certify an unexamined
 binary, firmware or third-party asset distribution. See [CREDITS.md](CREDITS.md),
 [NOTICE](NOTICE) and the full component notices. Nothing here adds restrictions
 to recipients' rights under the applicable licences.
+
+The eZ80 library in `vendor/ez80/` retains its [BSD-3-Clause licence](vendor/ez80/LICENSE) and [upstream attribution](vendor/ez80/README.md).
