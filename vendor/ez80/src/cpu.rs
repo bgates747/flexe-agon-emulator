@@ -218,6 +218,15 @@ impl Cpu {
         self.state.nmi_pending = true
     }
 
+    /// Initialize eZ80 CPU state for a machine reset without replacing the
+    /// decoder, debug settings, or lifetime instruction counter.
+    pub fn reset_ez80_state(&mut self) {
+        self.state = State {
+            instructions_executed: self.state.instructions_executed,
+            ..State::new()
+        };
+    }
+
     /// Take a pending eZ80 NMI at an instruction boundary without fetching
     /// the first handler instruction. The machine owns event arbitration.
     pub fn accept_pending_ez80_nmi(&mut self, sys: &mut dyn Machine) -> bool {

@@ -1,4 +1,4 @@
-// Flexe Agon Emulator eZ80 UART functional model and regressions.
+// Flexe Agon Emulator eZ80 UART.
 // GPL-3.0, matching the Fab frontend. Functional 8N1 model, not silicon timing.
 use std::collections::VecDeque;
 pub trait SerialLink {
@@ -25,6 +25,22 @@ impl Uart {
     }
     pub fn with_trace(mut self)->Self {
         self.trace=std::env::var_os("MOS_UART_STATS").map(std::path::PathBuf::from);self
+    }
+    pub(crate) fn reset(&mut self) {
+        self.rx_fifo.clear();
+        self.tx_fifo.clear();
+        self.shift = None;
+        self.receive_cooldown = 0;
+        self.rx_idle = 0;
+        self.cts = self.link.read_clear_to_send();
+        self.delta = 0;
+        self.errors = 0;
+        self.tx_pending = false;
+        self.ier = 0;
+        self.fctl = 0;
+        self.lctl = 0;
+        self.brg_div = 2;
+        self.spr = 0;
     }
     fn char_cycles(&self)->i32 { i32::from(self.brg_div.max(1))*160 }
     fn capacity(&self)->usize {if self.fctl&1!=0 {16} else {1}}

@@ -1,5 +1,10 @@
 # Source candidate validation
 
+## 0.1.1-rc2
+
+Watchdog regressions cover reset hold and restart, mixed-mode NMI frames,
+and repeated expiry after explicit handler service.
+
 ## 0.1.1-rc1
 
 The watchdog and NMI tests cover port readback, both modeled clock

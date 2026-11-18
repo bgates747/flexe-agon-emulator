@@ -85,6 +85,31 @@ fn reload_requires_a_pair_and_keeps_fractional_crystal_phase() {
 }
 
 #[test]
+fn delivered_nmi_can_be_rearmed_without_clearing_the_flag() {
+    let mut wdt = Watchdog::default();
+    wdt.write_control(0xc3);
+    wdt.advance(SHORT_PERIOD - 1, SYSTEM_HZ);
+    wdt.write_reload(0xa5);
+    wdt.advance(1, SYSTEM_HZ);
+    wdt.write_reload(0x5a); // Too late to cancel the pending NMI.
+    assert_eq!(wdt.take_expiry(), Some(Expiry::Nmi));
+    wdt.advance(SHORT_PERIOD * 2, SYSTEM_HZ);
+    wdt.write_reload(0x5a); // An unmatched byte must not rearm.
+    wdt.advance(SHORT_PERIOD, SYSTEM_HZ);
+    assert_eq!(wdt.take_expiry(), None);
+
+    for _ in 0..3 {
+        wdt.write_reload(0xa5);
+        wdt.write_reload(0x5a);
+        assert_eq!(wdt.read_control(), 0xe3);
+        wdt.advance(SHORT_PERIOD - 1, SYSTEM_HZ);
+        assert_eq!(wdt.take_expiry(), None);
+        wdt.advance(1, SYSTEM_HZ);
+        assert_eq!(wdt.take_expiry(), Some(Expiry::Nmi));
+    }
+}
+
+#[test]
 fn fast_path_nmi_frames_and_decoded_retn() {
     for (adl, madl, frame) in [
         (false, false, &[0x34, 0x12][..]),
@@ -217,22 +242,124 @@ fn latched_expiry_wins_over_same_instruction_service() {
 }
 
 #[test]
-fn chip_reset_event_stops_execution_without_a_soft_reset() {
-    let (mut machine, mut cpu) = halt_tests::fixture(16);
-    machine.port_out(CONTROL, 0x83);
-    machine.watchdog.advance(SHORT_PERIOD - 1, SYSTEM_HZ);
-    cpu.state.set_pc(0x1100); // NOP
-    machine.execute_instruction(&mut cpu);
-    assert!(machine.watchdog_reset_requested);
-    assert!(machine.emulator_shutdown.load(Ordering::Relaxed));
-    assert!(!machine.soft_reset.load(Ordering::Relaxed));
-    assert_eq!(machine.exit_status.load(Ordering::Relaxed), 2);
-    assert_eq!(machine.port_in(CONTROL), 0xa3);
-    let pc = cpu.state.pc();
-    assert_eq!(pc, 0x1101);
-    machine.execute_instruction(&mut cpu);
-    machine.do_interrupts(&mut cpu);
-    assert_eq!(cpu.state.pc(), pc);
+fn handler_reload_delivers_three_watchdog_nmis_and_resumes_halt_loop() {
+    let (mut machine, mut cpu) = halt_tests::fixture(64);
+    machine.mem_rom[0x1100..0x1103].copy_from_slice(&[0x76, 0x18, 0xfd]); // HALT; JR back.
+    machine.mem_rom[0x66..0x72].copy_from_slice(&[
+        0x3e, 0xa5, 0xed, 0x39, 0x94, // OUT0 (94h),A5h
+        0x3e, 0x5a, 0xed, 0x39, 0x94, // OUT0 (94h),5Ah
+        0xed, 0x45, // RETN
+    ]);
+    cpu.state.reg.iff1 = false;
+    cpu.state.reg.iff2 = false;
+    cpu.state.set_pc(0x1100);
+    let sp = cpu.state.sp();
+    machine.port_out(CONTROL, 0xc3);
+
+    for _ in 0..3 {
+        for _ in 0..SHORT_PERIOD {
+            machine.execute_instruction(&mut cpu);
+            if machine.cycle_counter.get() >= 64 {
+                machine.apply_elapsed_cycles();
+                machine.do_interrupts(&mut cpu);
+            }
+            if cpu.state.pc() == 0x66 {
+                break;
+            }
+        }
+        assert_eq!(cpu.state.pc(), 0x66);
+        assert_eq!(cpu.state.sp(), sp - 3);
+        for _ in 0..5 {
+            machine.execute_instruction(&mut cpu);
+        }
+        assert_eq!(cpu.state.pc(), 0x1101);
+        assert_eq!(cpu.state.sp(), sp);
+        assert!(!cpu.state.reg.get_iff1());
+        assert_eq!(machine.port_in(CONTROL), 0xe3);
+    }
+}
+
+#[test]
+fn watchdog_chip_reset_holds_257_cycles_and_restarts_from_flash() {
+    for precision in [1, 16, 64] {
+        let (mut machine, mut cpu) = halt_tests::fixture(precision);
+        machine.port_out(0x92, 0xaa);
+        machine.port_out(0x80, 0xc0); // Set PRT0's IRQ latch.
+        machine.port_out(0x9b, 0x00);
+        machine.port_out(0x9c, 0xff);
+        machine.port_out(0xa4, 0xff);
+        machine.port_out(0xc1, 0x07);
+        machine.port_out(0xc7, 0x55);
+        machine.port_out(0xd3, 0x80);
+        machine.port_out(0xd0, 0xe1);
+        machine.port_out(0xd1, 0x12);
+        machine.port_out(0xcb, 0x80);
+        machine.port_out(0xf7, 2); // Relocate flash before reset.
+        machine.port_out(0xf8, 0);
+        machine.poke(0x04_3456, 0xa6);
+        machine.poke(0xff_e002, 0x69);
+        machine.port_out(0xb4, 0);
+        machine.port_out(0xb5, 0x21);
+        machine.mem_rom[0..3].copy_from_slice(&[0xed, 0x38, 0x93]); // IN0 A,(93h).
+        machine.mem_rom[0x1100] = 0; // NOP at relocated flash.
+        cpu.state.reg.madl = true;
+        cpu.state.reg.mbase = 4;
+        cpu.state.set_pc(0x02_1100);
+        machine.port_out(CONTROL, 0x83);
+        machine.watchdog.advance(SHORT_PERIOD - 1, SYSTEM_HZ);
+        machine.execute_instruction(&mut cpu);
+        assert!(!machine.emulator_shutdown.load(Ordering::Relaxed));
+        assert!(!machine.soft_reset.load(Ordering::Relaxed));
+        assert_eq!(machine.exit_status.load(Ordering::Relaxed), 0);
+        assert_eq!(cpu.state.pc(), 0);
+        assert!(!cpu.state.reg.adl && !cpu.state.reg.madl);
+        assert_eq!(cpu.state.reg.mbase, 0);
+        assert!(!cpu.state.reg.get_iff1() && !cpu.state.reg.iff2);
+        assert!(!cpu.is_halted());
+        assert_eq!(machine.port_in(CONTROL), 0x20);
+        assert_eq!(machine.port_in(0x92), 0);
+        assert!(!machine.prt_timers[0].irq_due());
+        for direction in [0x9b, 0x9f, 0xa3] {
+            assert_eq!(machine.port_in(direction), 0xff);
+            assert_eq!(machine.port_in(direction + 1), 0);
+            assert_eq!(machine.port_in(direction + 2), 0);
+        }
+        assert_eq!(machine.port_in(0xc1), 0);
+        assert_eq!(machine.port_in(0xc5), 0x60);
+        assert_eq!(machine.port_in(0xc7), 0);
+        assert_eq!(machine.port_in(0xd3), 0);
+        assert_eq!(machine.uart1.brg_div, 2);
+        assert_eq!(machine.port_in(0xcb), 0);
+        assert_eq!(machine.port_in(0xb4), 0x80);
+        assert_eq!(machine.port_in(0xb5), 0xff);
+        assert_eq!(machine.port_in(0xf7), 0);
+        assert_eq!(machine.flash_waitstates, 4);
+        assert_eq!((machine.cs0_lbr, machine.cs0_ubr), (0, 0xff));
+        assert_eq!(machine.peek(0x04_3456), 0xa6);
+        assert_eq!(machine.peek(0xff_e002), 0x69);
+        machine.apply_elapsed_cycles();
+        let before_hold = machine.total_cycles_elapsed;
+        let retired = cpu.state.instructions_executed;
+        for _ in 0..257 {
+            machine.execute_instruction(&mut cpu);
+            if machine.cycle_counter.get() >= precision {
+                machine.apply_elapsed_cycles();
+                machine.do_interrupts(&mut cpu);
+            }
+            assert_eq!(cpu.state.pc(), 0);
+            assert_eq!(cpu.state.instructions_executed, retired);
+        }
+        machine.apply_elapsed_cycles();
+        assert_eq!(machine.total_cycles_elapsed - before_hold, 257);
+        machine.execute_instruction(&mut cpu);
+        assert_eq!(cpu.state.pc(), 3);
+        assert_eq!(cpu.state.reg.a(), 0x20);
+        assert_eq!(cpu.state.instructions_executed, retired + 1);
+
+        machine.port_out(CONTROL, 0xc3);
+        machine.watchdog.advance(SHORT_PERIOD, SYSTEM_HZ);
+        assert_eq!(machine.watchdog.take_expiry(), Some(Expiry::Nmi));
+    }
 }
 
 #[test]

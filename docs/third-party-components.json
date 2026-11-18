@@ -1,12 +1,12 @@
 {
-  "date": "2026-11-17",
+  "date": "2026-11-18",
   "scope": "Locked Linux workspace dependency census for this source-only candidate; no firmware, assets, host shared libraries or binaries bundled. Licence declarations are not a replacement for the actual component notices.",
-  "cargo_lock_sha256": "075c45041b996f829a86253afc493d8c87f9dfa70a606e723edeb0c5cc5879db",
+  "cargo_lock_sha256": "377d6d9c09411907b3a1c77d88ed2e46d27477a28069ee71fbf42bc9d5edfd9e",
   "package_count": 64,
   "packages": [
     {
       "name": "agon-cli-emulator",
-      "version": "0.1.1-rc1",
+      "version": "0.1.1-rc2",
       "authors": [
         "Tom Morton <tomm8086@gmail.com>"
       ],
@@ -18,7 +18,7 @@
     },
     {
       "name": "agon-ez80-emulator",
-      "version": "0.1.1-rc1",
+      "version": "0.1.1-rc2",
       "authors": [
         "Tom Morton <tomm8086@gmail.com>"
       ],
@@ -30,7 +30,7 @@
     },
     {
       "name": "agon-light-emulator-debugger",
-      "version": "0.1.1-rc1",
+      "version": "0.1.1-rc2",
       "authors": [
         "Tom Morton <tomm8086@gmail.com>"
       ],
@@ -157,7 +157,7 @@
       "license_file": "vendor/ez80/LICENSE",
       "repository": "https://github.com/tomm/ez80",
       "source": null,
-      "scope": "bundled library with eZ80 NMI entry change"
+      "scope": "bundled library with eZ80 NMI entry and CPU state reset"
     },
     {
       "name": "fd-lock",
@@ -185,7 +185,7 @@
     },
     {
       "name": "flexe-agon-emulator",
-      "version": "0.1.1-rc1",
+      "version": "0.1.1-rc2",
       "authors": [
         "Tom Morton <tomm8086@gmail.com>"
       ],

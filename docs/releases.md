@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.1.1-rc2 source prerelease
+
+The F92 watchdog now restarts the modeled chip in reset mode and supports
+repeated NMIs when the guest explicitly services the watchdog. The guest
+can resume its interrupted code with maskable interrupts disabled.
+
 ## 0.1.1-rc1 source prerelease
 
 The F92 watchdog can now wake the eZ80 from HALT and enter an NMI handler

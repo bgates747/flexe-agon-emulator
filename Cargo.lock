@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agon-cli-emulator"
-version = "0.1.1-rc1"
+version = "0.1.1-rc2"
 dependencies = [
  "agon-ez80-emulator",
  "agon-light-emulator-debugger",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "agon-ez80-emulator"
-version = "0.1.1-rc1"
+version = "0.1.1-rc2"
 dependencies = [
  "chrono",
  "ez80",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "agon-light-emulator-debugger"
-version = "0.1.1-rc1"
+version = "0.1.1-rc2"
 dependencies = [
  "agon-ez80-emulator",
  "ctrlc",
@@ -180,7 +180,7 @@ version = "0.4.3"
 
 [[package]]
 name = "flexe-agon-emulator"
-version = "0.1.1-rc1"
+version = "0.1.1-rc2"
 dependencies = [
  "agon-ez80-emulator",
  "agon-light-emulator-debugger",

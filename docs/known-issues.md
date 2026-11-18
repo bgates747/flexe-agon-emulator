@@ -1,4 +1,4 @@
-# Known issues — 0.1.1-rc1 source prerelease
+# Known issues — 0.1.1-rc2 source prerelease
 
 This list describes user-visible limitations of the selected source candidate.
 It does not claim that every reported stall has the same cause, or that a
@@ -14,7 +14,7 @@ successful run establishes a repair. Runtime/firmware identities matter.
 | UART/firmware | UART is an idealized8N1 model. CTS sampling, FIFO/RTS details, scheduling and inherited immediate-EI semantics limit physical timing conclusions. A firmware receive-recovery race has also been reproduced under controlled conditions. | Match the actual VDP firmware. The firmware race does not explain every loading stall, and this release does not bundle a firmware repair. Active UART-timeout divider/clock changes remain unqualified. |
 | UART1 IRQ | The current machine does not dispatch UART1 interrupts even though register/FIFO polling exists. | A polling serial client passing does not qualify an interrupt-driven UART1 client. No virtual ESP8266 modem is included. |
 | Timers and HALT | Candidate source includes HALT/wakeup, chip-select SRAM and timer-source corrections; combined runtime acceptance is still pending. RTC input is nominal and pin/scheduler timing is modeled. | Do not claim physical timer/synchronizer accuracy or treat source tests as released-runtime evidence. |
-| F92 watchdog | The first expiry can raise an eZ80 NMI. When the guest selects chip reset, the emulator reports the request and exits. | Full F92 reset, repeated expiry and native guest watchdog use still need qualification. |
+| F92 watchdog | Guest software can rearm watchdog NMIs with the service sequence. Watchdog reset restarts the modeled F92 from flash. | Automatic NMI recurrence and the external 50/60 Hz RTC source remain unverified on hardware. |
 | Keyboard | Required ULP operations and PS/2 paths are modeled, with scheduling accommodations. | Unsupported ULP instructions fail closed; broader hardware parity and other firmware/layout combinations remain unqualified. |
 | Host load | Sustained emulation can heavily load CPUs and cooling. | Optional Linux CPU quota reduces available CPU time and may slow the guest. It does not guarantee safe temperatures or change CPU boost. |
 | Upstream parity | Based on Fab1.2.5; newer1.2.6 changes are not fully integrated, including debugger and printer features. | Do not assume current upstream options or native-VDP functionality exist here. See [release notes](releases.md). |
